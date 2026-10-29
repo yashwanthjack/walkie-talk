@@ -36,26 +36,41 @@ async def health():
 @app.websocket("/ws/{room_id}/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     await websocket.accept()
+    async def connect(self, websocket: WebSocket, room_id: str, client_id: str):
+        await websocket.accept()
+        
+        if room_id not in self.rooms:
+            self.rooms[room_id] = {}
+
+        # 1. Send the existing room state to the NEW joiner
+        existing_peers = list(self.rooms[room_id].keys())
+        await websocket.send_json({
+            "type": "room_state",
+            "peers": existing_peers
+        })
+
+        # 2. Add the new client to the room
+        self.rooms[room_id][client_id] = websocket
+
+        # 3. Notify existing peers that a new peer joined
+        for peer_id, connection in self.rooms[room_id].items():
+            if peer_id != client_id:
+                await connection.send_json({
+                    "type": "peer_joined",
+                    "peerId": client_id
+                })
 
     # Register in room
     if room_id not in rooms:
         rooms[room_id] = {}
-
-    existing_peers = list(rooms[room_id].keys())  # snapshot BEFORE adding the new user
     rooms[room_id][user_id] = websocket
     log.info(f"[{room_id}] '{user_id}' joined. Peers in room: {list(rooms[room_id].keys())}")
 
-    # 1. Tell the NEW joiner about everyone already in the room
-    if existing_peers:
-        await websocket.send_text(json.dumps({
-            "type": "room_state",
-            "peers": existing_peers,
-        }))
-
-    # 2. Tell EXISTING peers that a new user just arrived
+    # Notify all other peers in the room that a new user joined
     await _broadcast_to_room(room_id, user_id, {
         "type": "peer_joined",
         "user_id": user_id,
+        "peers": [uid for uid in rooms[room_id] if uid != user_id],
     })
 
     try:

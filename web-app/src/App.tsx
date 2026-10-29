@@ -13,6 +13,13 @@ export default function App() {
   const [userId, setUserId] = useState('');
   const [connState, setConnState] = useState<ConnState>('disconnected');
   const [peers, setPeers] = useState<string[]>([]);
+
+  // FIX 1: Ref to bypass React stale closures in WebRTC callbacks
+  const peersRef = useRef<string[]>([]);
+  useEffect(() => {
+    peersRef.current = peers;
+  }, [peers]);
+
   const [isTransmitting, setIsTransmitting] = useState(false);
   const [isReceiving, setIsReceiving] = useState(false);
   const [statusMsg, setStatusMsg] = useState('Waiting for partner...');
@@ -27,7 +34,6 @@ export default function App() {
   const makingOfferRef = useRef(false);
   const ignoreOfferRef = useRef(false);
   const politeRef = useRef(false); // polite peer = second to join
-  const peersRef = useRef<string[]>([]);
 
   // ─── Cleanup ────────────────────────────────────────────────────────────
   const cleanup = useCallback(() => {
@@ -116,7 +122,7 @@ export default function App() {
     // ICE candidates
     pc.onicecandidate = (e) => {
       if (e.candidate && ws.readyState === WebSocket.OPEN) {
-        const targetId = peersRef.current[0];
+        const targetId = peersRef.current[0]; // FIX 2: Use ref instead of stale state
         if (targetId) {
           ws.send(JSON.stringify({ type: 'ice-candidate', target_id: targetId, candidate: e.candidate }));
         }
@@ -139,7 +145,7 @@ export default function App() {
     };
 
     pc.onnegotiationneeded = async () => {
-      if (peersRef.current.length === 0) return; // no partner yet
+      if (peersRef.current.length === 0) return; // FIX 2: Use ref
       try {
         makingOfferRef.current = true;
         await pc.setLocalDescription();
@@ -158,37 +164,36 @@ export default function App() {
   const handleSignal = async (msg: Record<string, unknown>, uid: string, room: string, ws: WebSocket) => {
     const pc = pcRef.current;
 
-    // We just joined and the server tells us who's already here
+    // FIX 3: Handle existing peers (sent to the new joiner)
     if (msg.type === 'room_state') {
-      const existingPeers = msg.peers as string[];
+      const existingPeers = (msg.peers as string[]) ?? [];
       setPeers(existingPeers);
-      peersRef.current = existingPeers;
-      politeRef.current = false; // We are the newcomer = impolite = we send the offer
+      politeRef.current = true; // Second to join is polite (wait for offer)
+      if (existingPeers.length > 0) {
+        setStatusMsg(`🔄 Partner found! Establishing P2P...`);
+      }
+    }
+
+    // FIX 3: Handle a new peer joining (sent to the existing peer)
+    if (msg.type === 'peer_joined') {
+      const newPeer = msg.peerId as string;
+      setPeers(prev => [...prev, newPeer]);
+      politeRef.current = false; // First in room is impolite (creates the offer)
       setStatusMsg(`🔄 Partner found! Establishing P2P...`);
 
-      // Initiate WebRTC offer to the first existing peer
-      if (existingPeers.length > 0 && pc) {
+      // Impolite peer initiates the offer
+      if (pc) {
         try {
           makingOfferRef.current = true;
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
-          ws.send(JSON.stringify({ type: 'offer', target_id: existingPeers[0], offer: pc.localDescription }));
+          ws.send(JSON.stringify({ type: 'offer', target_id: newPeer, offer: pc.localDescription }));
         } catch (e) {
           console.error('Offer error:', e);
         } finally {
           makingOfferRef.current = false;
         }
       }
-    }
-
-    // Someone new joined our room — we were here first
-    if (msg.type === 'peer_joined') {
-      const newPeer = msg.user_id as string;
-      const updated = [...peersRef.current.filter(id => id !== newPeer), newPeer];
-      setPeers(updated);
-      peersRef.current = updated;
-      politeRef.current = true; // We are the existing peer = polite = we wait for their offer
-      setStatusMsg(`🔄 Partner found! Establishing P2P...`);
     }
 
     if (msg.type === 'peer_left') {
@@ -206,7 +211,7 @@ export default function App() {
 
       await pc.setRemoteDescription(new RTCSessionDescription(msg.offer as RTCSessionDescriptionInit));
       await pc.setLocalDescription();
-      ws.send(JSON.stringify({ type: 'answer', target_id: msg.user_id ?? peers[0], answer: pc.localDescription }));
+      ws.send(JSON.stringify({ type: 'answer', target_id: msg.user_id ?? peersRef.current[0], answer: pc.localDescription }));
     }
 
     if (msg.type === 'answer') {
@@ -238,14 +243,14 @@ export default function App() {
     if (connState !== 'connected') return;
     setIsTransmitting(true);
     localStreamRef.current?.getAudioTracks().forEach(t => (t.enabled = true));
-    wsRef.current?.send(JSON.stringify({ type: 'ptt_start', target_id: peersRef.current[0] }));
+    wsRef.current?.send(JSON.stringify({ type: 'ptt_start', target_id: peers[0] }));
     if (navigator.vibrate) navigator.vibrate(40);
   };
 
   const handlePTTEnd = () => {
     setIsTransmitting(false);
     localStreamRef.current?.getAudioTracks().forEach(t => (t.enabled = false));
-    wsRef.current?.send(JSON.stringify({ type: 'ptt_end', target_id: peersRef.current[0] }));
+    wsRef.current?.send(JSON.stringify({ type: 'ptt_end', target_id: peers[0] }));
   };
 
   const triggerIncomingPing = () => {
