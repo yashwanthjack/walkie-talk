@@ -16,10 +16,7 @@ app = FastAPI(title="Walkie-Talkie Signaling Server", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://web-app-delta-pink.vercel.app",
-        "*",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,29 +36,6 @@ async def health():
 @app.websocket("/ws/{room_id}/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     await websocket.accept()
-    async def connect(self, websocket: WebSocket, room_id: str, client_id: str):
-        await websocket.accept()
-        
-        if room_id not in self.rooms:
-            self.rooms[room_id] = {}
-
-        # 1. Send the existing room state to the NEW joiner
-        existing_peers = list(self.rooms[room_id].keys())
-        await websocket.send_json({
-            "type": "room_state",
-            "peers": existing_peers
-        })
-
-        # 2. Add the new client to the room
-        self.rooms[room_id][client_id] = websocket
-
-        # 3. Notify existing peers that a new peer joined
-        for peer_id, connection in self.rooms[room_id].items():
-            if peer_id != client_id:
-                await connection.send_json({
-                    "type": "peer_joined",
-                    "peerId": client_id
-                })
 
     # Register in room
     if room_id not in rooms:
