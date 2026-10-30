@@ -1,0 +1,55 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web-app/package-lock.json
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install web app dependencies
+        working-directory: web-app
+        run: npm install
+
+      - name: Build Vite app
+        working-directory: web-app
+        run: npm run build
+
+      - name: Sync Capacitor Android project
+        working-directory: web-app
+        run: npx cap sync android
+
+      - name: Make Gradle wrapper executable
+        working-directory: web-app/android
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        working-directory: web-app/android
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkie-talkie-app
+          path: web-app/android/app/build/outputs/apk/debug/app-debug.apk

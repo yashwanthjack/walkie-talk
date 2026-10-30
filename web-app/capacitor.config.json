@@ -1,0 +1,9 @@
+{
+  "appId": "com.walkietalkie.app",
+  "appName": "WalkieTalkie",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  }
+}

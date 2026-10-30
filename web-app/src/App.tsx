@@ -1,4 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ForegroundService,
+  Importance,
+  ServiceType,
+} from '@capawesome-team/capacitor-android-foreground-service';
 import { WS_BASE_URL, RTC_CONFIG, COLORS } from './constants';
 import './App.css';
 
@@ -36,7 +41,13 @@ export default function App() {
   const politeRef = useRef(false); // polite peer = second to join
 
   // ─── Cleanup ────────────────────────────────────────────────────────────
-  const cleanup = useCallback(() => {
+  const cleanup = useCallback(async () => {
+    try {
+      await ForegroundService.stopForegroundService();
+    } catch (error) {
+      console.warn('Foreground service stop failed:', error);
+    }
+
     wsRef.current?.close();
     pcRef.current?.close();
     localStreamRef.current?.getTracks().forEach(t => t.stop());
@@ -45,7 +56,9 @@ export default function App() {
     localStreamRef.current = null;
   }, []);
 
-  useEffect(() => () => cleanup(), [cleanup]);
+  useEffect(() => {
+    void cleanup();
+  }, [cleanup]);
 
   // ─── Join Room ──────────────────────────────────────────────────────────
   const joinRoom = async () => {
@@ -62,6 +75,27 @@ export default function App() {
       stream.getAudioTracks().forEach(t => (t.enabled = false)); // muted until PTT
       localStreamRef.current = stream;
       setMicAllowed(true);
+
+      try {
+        await ForegroundService.createNotificationChannel({
+          id: 'walkie_talkie_channel',
+          name: 'Walkie Talkie',
+          description: 'Background microphone service for Walkie Talkie',
+          importance: Importance.Default,
+        });
+
+        await ForegroundService.startForegroundService({
+          id: 5001,
+          title: 'Walkie-Talkie',
+          body: `Room: ${trimRoom}`,
+          smallIcon: 'ic_launcher_background',
+          notificationChannelId: 'walkie_talkie_channel',
+          serviceType: ServiceType.Microphone,
+          silent: false,
+        });
+      } catch (error) {
+        console.warn('Foreground service start failed:', error);
+      }
     } catch {
       setMicAllowed(false);
       setStatusMsg('❌ Microphone permission denied. Please allow mic access and try again.');
@@ -100,7 +134,7 @@ export default function App() {
   };
 
   // ─── Peer Connection ─────────────────────────────────────────────────────
-  const initPeerConnection = (room: string, uid: string, ws: WebSocket) => {
+  const initPeerConnection = (_room: string, _uid: string, ws: WebSocket) => {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     pcRef.current = pc;
 
@@ -161,7 +195,7 @@ export default function App() {
   };
 
   // ─── Signaling Message Handler ───────────────────────────────────────────
-  const handleSignal = async (msg: Record<string, unknown>, uid: string, room: string, ws: WebSocket) => {
+  const handleSignal = async (msg: Record<string, unknown>, _uid: string, _room: string, ws: WebSocket) => {
     const pc = pcRef.current;
 
     // FIX 3: Handle existing peers (sent to the new joiner)
@@ -405,7 +439,13 @@ export default function App() {
           <button
             id="leave-btn"
             className="leave-btn"
-            onClick={() => { cleanup(); setPhase('join'); setConnState('disconnected'); setPeers([]); setStatusMsg(''); }}
+            onClick={() => {
+              void cleanup();
+              setPhase('join');
+              setConnState('disconnected');
+              setPeers([]);
+              setStatusMsg('');
+            }}
           >
             Leave Room
           </button>
