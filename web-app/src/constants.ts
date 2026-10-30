@@ -13,10 +13,8 @@
  */
 
 // ─── Backend ────────────────────────────────────────────────────────────────
-// In dev, Vite proxies /ws/* to the FastAPI backend (see vite.config.ts).
-// In production, configure your reverse proxy (nginx, Caddy, etc.) to do the same.
-const WS_PROTOCOL = window.location.protocol === "https:" ? "wss" : "ws";
-export const WS_BASE_URL = `${WS_PROTOCOL}://${window.location.host}/ws`;
+// Live Render backend for production deployment.
+export const WS_BASE_URL = 'wss://walkie-talk.onrender.com';
 
 // ─── WebRTC ──────────────────────────────────────────────────────────────────
 export const RTC_CONFIG: RTCConfiguration = {
