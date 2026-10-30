@@ -16,7 +16,10 @@ app = FastAPI(title="Walkie-Talkie Signaling Server", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://web-app-delta-pink.vercel.app",
+        "*",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
