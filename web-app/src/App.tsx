@@ -105,7 +105,7 @@ export default function App() {
 
     // 2. Connect WebSocket
     setStatusMsg('Connecting to signaling server...');
-    const ws = new WebSocket(`${WS_BASE_URL}/${trimRoom}/${trimUser}`);
+    const ws = new WebSocket(`${WS_BASE_URL}/ws/${trimRoom}/${trimUser}`);
     wsRef.current = ws;
 
     ws.onopen = () => {
