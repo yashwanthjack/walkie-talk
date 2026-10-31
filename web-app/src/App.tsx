@@ -19,7 +19,7 @@ export default function App() {
   const [connState, setConnState] = useState<ConnState>('disconnected');
   const [peers, setPeers] = useState<string[]>([]);
 
-  // FIX 1: Ref to bypass React stale closures in WebRTC callbacks
+  // Ref to bypass React stale closures in WebRTC callbacks
   const peersRef = useRef<string[]>([]);
   useEffect(() => {
     peersRef.current = peers;
@@ -38,7 +38,10 @@ export default function App() {
   const pingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const makingOfferRef = useRef(false);
   const ignoreOfferRef = useRef(false);
-  const politeRef = useRef(false); // polite peer = second to join
+  const politeRef = useRef(false); // polite peer = newcomer (waits for offer)
+
+  // ICE candidate queue — holds candidates that arrive before remoteDescription is set
+  const iceCandidateQueueRef = useRef<RTCIceCandidateInit[]>([]);
 
   // ─── Cleanup ────────────────────────────────────────────────────────────
   const cleanup = useCallback(async () => {
@@ -54,11 +57,25 @@ export default function App() {
     wsRef.current = null;
     pcRef.current = null;
     localStreamRef.current = null;
+    iceCandidateQueueRef.current = [];
   }, []);
 
   useEffect(() => {
     void cleanup();
   }, [cleanup]);
+
+  // ─── Flush queued ICE candidates ────────────────────────────────────────
+  const flushIceCandidateQueue = async (pc: RTCPeerConnection) => {
+    const queued = iceCandidateQueueRef.current;
+    iceCandidateQueueRef.current = [];
+    for (const candidate of queued) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.warn('Queued ICE candidate error:', e);
+      }
+    }
+  };
 
   // ─── Join Room ──────────────────────────────────────────────────────────
   const joinRoom = async () => {
@@ -110,7 +127,7 @@ export default function App() {
 
     ws.onopen = () => {
       setStatusMsg('Waiting for partner...');
-      initPeerConnection(trimRoom, trimUser, ws);
+      initPeerConnection(ws);
       setPhase('ready');
     };
 
@@ -129,12 +146,12 @@ export default function App() {
 
     ws.onmessage = async (event) => {
       const msg = JSON.parse(event.data);
-      await handleSignal(msg, trimUser, trimRoom, ws);
+      await handleSignal(msg, ws);
     };
   };
 
   // ─── Peer Connection ─────────────────────────────────────────────────────
-  const initPeerConnection = (_room: string, _uid: string, ws: WebSocket) => {
+  const initPeerConnection = (ws: WebSocket) => {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     pcRef.current = pc;
 
@@ -145,18 +162,19 @@ export default function App() {
 
     // Remote audio
     pc.ontrack = (e) => {
-      if (remoteAudioRef.current) {
-        remoteAudioRef.current.srcObject = e.streams[0];
+      const audioEl = remoteAudioRef.current;
+      if (audioEl) {
+        audioEl.srcObject = e.streams[0];
+        audioEl.play().catch(err => console.warn('Audio autoplay blocked:', err));
       }
-      // Detect when remote audio is playing
       setIsReceiving(true);
       e.streams[0].getTracks()[0].onended = () => setIsReceiving(false);
     };
 
-    // ICE candidates
+    // ICE candidates → send to the first known peer
     pc.onicecandidate = (e) => {
       if (e.candidate && ws.readyState === WebSocket.OPEN) {
-        const targetId = peersRef.current[0]; // FIX 2: Use ref instead of stale state
+        const targetId = peersRef.current[0];
         if (targetId) {
           ws.send(JSON.stringify({ type: 'ice-candidate', target_id: targetId, candidate: e.candidate }));
         }
@@ -185,8 +203,9 @@ export default function App() {
       }
     };
 
+    // onnegotiationneeded — only fires as a fallback for re-negotiation
     pc.onnegotiationneeded = async () => {
-      if (peersRef.current.length === 0) return; // FIX 2: Use ref
+      if (peersRef.current.length === 0) return; // no peers yet, skip
       try {
         makingOfferRef.current = true;
         await pc.setLocalDescription();
@@ -202,27 +221,29 @@ export default function App() {
   };
 
   // ─── Signaling Message Handler ───────────────────────────────────────────
-  const handleSignal = async (msg: Record<string, unknown>, _uid: string, _room: string, ws: WebSocket) => {
+  const handleSignal = async (msg: Record<string, unknown>, ws: WebSocket) => {
     const pc = pcRef.current;
 
-    // FIX 3: Handle existing peers (sent to the new joiner)
+    // ── room_state: sent to the newcomer with existing peer IDs ──
     if (msg.type === 'room_state') {
       const existingPeers = (msg.peers as string[]) ?? [];
       setPeers(existingPeers);
-      politeRef.current = true; // Second to join is polite (wait for offer)
+      politeRef.current = true; // newcomer is polite (waits for offer)
       if (existingPeers.length > 0) {
-        setStatusMsg(`🔄 Partner found! Establishing P2P...`);
+        setStatusMsg('🔄 Partner found! Waiting for connection...');
       }
+      return;
     }
 
-    // FIX 3: Handle a new peer joining (sent to the existing peer)
+    // ── peer_joined: sent to existing peers when a newcomer joins ──
     if (msg.type === 'peer_joined') {
-      const newPeer = msg.peerId as string;
+      const newPeer = msg.user_id as string;
+      if (!newPeer) return;
       setPeers(prev => [...prev, newPeer]);
-      politeRef.current = false; // First in room is impolite (creates the offer)
-      setStatusMsg(`🔄 Partner found! Establishing P2P...`);
+      politeRef.current = false; // existing peer is impolite (creates offer)
+      setStatusMsg('🔄 Partner found! Establishing P2P...');
 
-      // Impolite peer initiates the offer
+      // Existing peer creates the offer
       if (pc) {
         try {
           makingOfferRef.current = true;
@@ -235,39 +256,74 @@ export default function App() {
           makingOfferRef.current = false;
         }
       }
+      return;
     }
 
+    // ── peer_left ──
     if (msg.type === 'peer_left') {
       setConnState('disconnected');
       setStatusMsg('⚠️ Partner left the room');
       setPeers(p => p.filter(id => id !== msg.user_id));
+      return;
     }
 
     if (!pc) return;
 
+    // ── offer ──
     if (msg.type === 'offer') {
+      const senderId = msg.from_user as string;
+
+      // Make sure we track the sender as a peer
+      if (senderId) {
+        setPeers(prev => {
+          if (!prev.includes(senderId)) return [...prev, senderId];
+          return prev;
+        });
+        // Also update the ref immediately so ICE candidates have a target
+        if (!peersRef.current.includes(senderId)) {
+          peersRef.current = [...peersRef.current, senderId];
+        }
+      }
+
       const offerCollision = makingOfferRef.current || pc.signalingState !== 'stable';
       ignoreOfferRef.current = !politeRef.current && offerCollision;
       if (ignoreOfferRef.current) return;
 
       await pc.setRemoteDescription(new RTCSessionDescription(msg.offer as RTCSessionDescriptionInit));
+      // Flush any ICE candidates that arrived before remoteDescription was set
+      await flushIceCandidateQueue(pc);
+
       await pc.setLocalDescription();
-      ws.send(JSON.stringify({ type: 'answer', target_id: msg.user_id ?? peersRef.current[0], answer: pc.localDescription }));
+      const targetId = senderId ?? peersRef.current[0];
+      ws.send(JSON.stringify({ type: 'answer', target_id: targetId, answer: pc.localDescription }));
+      return;
     }
 
+    // ── answer ──
     if (msg.type === 'answer') {
       if (pc.signalingState !== 'have-local-offer') return;
       await pc.setRemoteDescription(new RTCSessionDescription(msg.answer as RTCSessionDescriptionInit));
+      // Flush any ICE candidates that arrived before remoteDescription was set
+      await flushIceCandidateQueue(pc);
+      return;
     }
 
+    // ── ice-candidate ──
     if (msg.type === 'ice-candidate' && msg.candidate) {
       try {
-        await pc.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit));
+        if (pc.remoteDescription) {
+          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit));
+        } else {
+          // Queue — will be flushed after setRemoteDescription
+          iceCandidateQueueRef.current.push(msg.candidate as RTCIceCandidateInit);
+        }
       } catch (e) {
         if (!ignoreOfferRef.current) console.error('ICE error:', e);
       }
+      return;
     }
 
+    // ── PTT signals ──
     if (msg.type === 'ptt_start') {
       setIsReceiving(true);
       triggerIncomingPing();
@@ -284,14 +340,14 @@ export default function App() {
     if (connState !== 'connected') return;
     setIsTransmitting(true);
     localStreamRef.current?.getAudioTracks().forEach(t => (t.enabled = true));
-    wsRef.current?.send(JSON.stringify({ type: 'ptt_start', target_id: peers[0] }));
+    wsRef.current?.send(JSON.stringify({ type: 'ptt_start', target_id: peersRef.current[0] }));
     if (navigator.vibrate) navigator.vibrate(40);
   };
 
   const handlePTTEnd = () => {
     setIsTransmitting(false);
     localStreamRef.current?.getAudioTracks().forEach(t => (t.enabled = false));
-    wsRef.current?.send(JSON.stringify({ type: 'ptt_end', target_id: peers[0] }));
+    wsRef.current?.send(JSON.stringify({ type: 'ptt_end', target_id: peersRef.current[0] }));
   };
 
   const triggerIncomingPing = () => {

@@ -43,24 +43,35 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     rooms[room_id][user_id] = websocket
     log.info(f"[{room_id}] '{user_id}' joined. Peers in room: {list(rooms[room_id].keys())}")
 
-    # Notify all other peers in the room that a new user joined
+    # 1. Tell the newcomer who is already in the room
+    existing_peers = [uid for uid in rooms[room_id] if uid != user_id]
+    await websocket.send_text(json.dumps({
+        "type": "room_state",
+        "peers": existing_peers,
+    }))
+
+    # 2. Notify existing peers that a new user joined
     await _broadcast_to_room(room_id, user_id, {
         "type": "peer_joined",
         "user_id": user_id,
-        "peers": [uid for uid in rooms[room_id] if uid != user_id],
     })
 
     try:
         while True:
             raw = await websocket.receive_text()
             message = json.loads(raw)
+
+            # Stamp the sender so the receiver knows who sent it
+            message["from_user"] = user_id
+            enriched = json.dumps(message)
+
             target_id = message.get("target_id")
 
             if target_id:
                 # Unicast: relay directly to the specified peer
                 target_ws = rooms.get(room_id, {}).get(target_id)
                 if target_ws:
-                    await target_ws.send_text(raw)
+                    await target_ws.send_text(enriched)
                 else:
                     log.warning(f"[{room_id}] Target '{target_id}' not found.")
                     await websocket.send_text(json.dumps({
@@ -94,7 +105,8 @@ async def _broadcast_to_room(room_id: str, exclude_user_id: str | None, message:
             continue
         try:
             await ws.send_text(json.dumps(message))
-        except Exception:
+        except Exception as e:
+            log.warning(f"[{room_id}] Send to '{uid}' failed ({e}), marking dead.")
             dead.append(uid)
     for uid in dead:
         _cleanup(room_id, uid)
