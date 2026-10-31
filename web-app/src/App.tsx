@@ -178,6 +178,13 @@ export default function App() {
       }
     };
 
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        setConnState('connected');
+        setStatusMsg('🟢 Partner connected');
+      }
+    };
+
     pc.onnegotiationneeded = async () => {
       if (peersRef.current.length === 0) return; // FIX 2: Use ref
       try {
