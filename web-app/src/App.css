@@ -503,6 +503,14 @@ body {
   line-height: 1;
 }
 
+.ptt-sublabel {
+  font-size: 9px;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+  text-transform: none;
+  font-weight: 500;
+}
+
 /* Active state */
 .ptt-tx {
   background: radial-gradient(circle at 35% 35%, #3D2ECC 0%, #1a0d8a 100%);
@@ -519,6 +527,25 @@ body {
 .ptt-tx .ptt-icon {
   transform: scale(1.1);
   filter: drop-shadow(0 0 10px rgba(124, 106, 255, 0.8));
+}
+
+/* Half-Duplex Channel Collision / Busy Lock */
+.ptt-locked {
+  border-color: var(--danger) !important;
+  background: radial-gradient(circle at 35% 35%, #2a0b12 0%, #150609 100%) !important;
+  color: #ff8599 !important;
+  opacity: 0.9 !important;
+  box-shadow: 0 0 24px rgba(255, 77, 106, 0.3) !important;
+  cursor: not-allowed !important;
+}
+
+.ptt-locked .ptt-icon {
+  animation: lockShake 1.5s infinite ease-in-out;
+}
+
+@keyframes lockShake {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.08); }
 }
 
 /* Incoming ping flash */
@@ -617,6 +644,279 @@ body {
 
 @media (min-height: 800px) {
   .ptt-main {
-    gap: 40px;
+    gap: 32px;
   }
+}
+
+/* ─── Tactical Features & Controls ────────────────────────────────────────── */
+.badge-optional {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--elevated);
+  border: 1px solid var(--border);
+  padding: 2px 6px;
+  border-radius: 4px;
+  margin-left: 8px;
+  font-weight: 600;
+}
+
+.pin-badge {
+  margin-left: 6px;
+  font-size: 11px;
+}
+
+.wakelock-badge {
+  margin-left: 8px;
+  font-size: 10px;
+  color: var(--success);
+  background: rgba(34, 211, 238, 0.1);
+  border: 1px solid rgba(34, 211, 238, 0.25);
+  padding: 2px 7px;
+  border-radius: 99px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
+.urgent-banner {
+  position: fixed;
+  top: 76px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: linear-gradient(135deg, #FF4D6A 0%, #D62846 100%);
+  color: #fff;
+  padding: 10px 20px;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  z-index: 200;
+  box-shadow: 0 8px 32px rgba(255, 77, 106, 0.55);
+  animation: urgentPulse 0.5s ease-in-out infinite alternate;
+  letter-spacing: 0.5px;
+}
+
+@keyframes urgentPulse {
+  from { transform: translateX(-50%) scale(1); }
+  to { transform: translateX(-50%) scale(1.03); }
+}
+
+.telemetry-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-sec);
+  margin-top: 4px;
+}
+
+.partner-name strong {
+  color: var(--text-pri);
+}
+
+.telemetry-pill {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  padding: 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.telemetry-item {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Transmit Indicator Active State */
+.rx-indicator.tx-active {
+  border-color: rgba(124, 106, 255, 0.4);
+  background: rgba(124, 106, 255, 0.08);
+}
+
+.rx-indicator.tx-active .rx-bar {
+  background: var(--primary);
+  animation: rxPulse 0.4s ease-in-out infinite alternate;
+}
+
+/* Controls Toolbar */
+.action-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 330px;
+  margin-top: 4px;
+}
+
+.action-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 10px;
+  color: var(--text-sec);
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+  min-height: 42px;
+}
+
+.action-btn:hover:not(:disabled) {
+  background: var(--elevated);
+  border-color: var(--primary);
+  color: var(--text-pri);
+  transform: translateY(-1px);
+}
+
+.action-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.action-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.buzzer-btn:hover:not(:disabled) {
+  border-color: var(--warning);
+  color: var(--warning);
+  box-shadow: 0 0 16px rgba(255, 181, 71, 0.2);
+}
+
+.replay-btn.has-clips {
+  border-color: rgba(34, 211, 238, 0.35);
+  color: var(--success);
+}
+
+.replay-btn.is-playing {
+  background: rgba(34, 211, 238, 0.15);
+  border-color: var(--success);
+  color: #fff;
+  animation: pulseReplay 1s infinite alternate;
+}
+
+@keyframes pulseReplay {
+  from { box-shadow: 0 0 8px rgba(34, 211, 238, 0.2); }
+  to { box-shadow: 0 0 18px rgba(34, 211, 238, 0.5); }
+}
+
+.vox-btn.vox-active {
+  background: rgba(124, 106, 255, 0.2);
+  border-color: var(--primary);
+  color: #fff;
+  box-shadow: 0 0 14px rgba(124, 106, 255, 0.3);
+}
+
+/* VOX VU Meter */
+.vox-meter-container {
+  width: 100%;
+  max-width: 330px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.vox-meter-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.vox-meter-track {
+  position: relative;
+  height: 6px;
+  background: var(--elevated);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.vox-meter-fill {
+  height: 100%;
+  transition: width 0.05s ease-out;
+  border-radius: 3px;
+}
+
+.vox-meter-threshold {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--warning);
+  box-shadow: 0 0 4px var(--warning);
+}
+
+/* Missed Audio Replay History */
+.replay-history {
+  width: 100%;
+  max-width: 330px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.history-title {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.history-chip {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--text-sec);
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: var(--font);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.history-chip:hover {
+  background: var(--elevated);
+  border-color: var(--primary);
+  color: var(--text-pri);
+}
+
+.chip-playing {
+  border-color: var(--success);
+  color: var(--success);
+  background: rgba(34, 211, 238, 0.08);
 }
