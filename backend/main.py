@@ -37,6 +37,23 @@ async def health():
 async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     await websocket.accept()
 
+    # Prevent duplicate usernames in the same room if the existing socket is alive
+    if room_id in rooms and user_id in rooms[room_id]:
+        existing_ws = rooms[room_id][user_id]
+        try:
+            # Check if previous connection is still alive
+            await existing_ws.send_text(json.dumps({"type": "ping"}))
+            # It's alive! Reject duplicate so it doesn't hijack or disconnect the active peer
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": f"Callsign '{user_id}' is already in use on this channel. Please use a different name for this device (e.g. {user_id}-2).",
+            }))
+            await websocket.close(code=4003, reason="Callsign already in use")
+            return
+        except Exception:
+            # Existing socket is dead/stale, prune it
+            _cleanup(room_id, user_id, existing_ws)
+
     # Register in room
     if room_id not in rooms:
         rooms[room_id] = {}
@@ -83,39 +100,42 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
                 await _broadcast_to_room(room_id, user_id, message)
 
     except WebSocketDisconnect:
-        _cleanup(room_id, user_id)
+        is_active = (rooms.get(room_id, {}).get(user_id) == websocket)
+        _cleanup(room_id, user_id, websocket)
         log.info(f"[{room_id}] '{user_id}' disconnected.")
-        # Notify remaining peers
-        await _broadcast_to_room(room_id, None, {
-            "type": "peer_left",
-            "user_id": user_id,
-        })
+        if is_active:
+            # Only notify remaining peers if this socket was the active one
+            await _broadcast_to_room(room_id, None, {
+                "type": "peer_left",
+                "user_id": user_id,
+            })
 
     except Exception as e:
         log.error(f"[{room_id}] Error for '{user_id}': {e}")
-        _cleanup(room_id, user_id)
+        _cleanup(room_id, user_id, websocket)
 
 
 async def _broadcast_to_room(room_id: str, exclude_user_id: str | None, message: dict):
     """Send a message to all peers in a room except the sender."""
     peers = rooms.get(room_id, {})
     dead = []
-    for uid, ws in peers.items():
+    for uid, ws in list(peers.items()):
         if uid == exclude_user_id:
             continue
         try:
             await ws.send_text(json.dumps(message))
         except Exception as e:
             log.warning(f"[{room_id}] Send to '{uid}' failed ({e}), marking dead.")
-            dead.append(uid)
-    for uid in dead:
-        _cleanup(room_id, uid)
+            dead.append((uid, ws))
+    for uid, ws in dead:
+        _cleanup(room_id, uid, ws)
 
 
-def _cleanup(room_id: str, user_id: str):
-    """Remove a user from its room and prune empty rooms."""
+def _cleanup(room_id: str, user_id: str, ws: WebSocket | None = None):
+    """Remove a user from its room if the websocket matches, and prune empty rooms."""
     if room_id in rooms:
-        rooms[room_id].pop(user_id, None)
-        if not rooms[room_id]:
-            del rooms[room_id]
-            log.info(f"[{room_id}] Room is now empty and removed.")
+        if ws is None or rooms[room_id].get(user_id) == ws:
+            rooms[room_id].pop(user_id, None)
+            if not rooms[room_id]:
+                del rooms[room_id]
+                log.info(f"[{room_id}] Room is now empty and removed.")

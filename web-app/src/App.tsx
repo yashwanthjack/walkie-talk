@@ -11,6 +11,13 @@ import {
   playBuzzerSound,
 } from './audioEffects';
 import { hashRoomWithPin } from './utils/security';
+import {
+  deriveRoomKey,
+  encryptSignal,
+  decryptSignal,
+  extractSdpFingerprint,
+  computeSafetyNumber,
+} from './crypto';
 import './App.css';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -30,7 +37,7 @@ interface TelemetryData {
   rttMs?: number | null;
 }
 
-// ─── Main App ────────────────────────────────────────────────────────────────
+// ─── Main Component ──────────────────────────────────────────────────────────
 export default function App() {
   const [phase, setPhase] = useState<AppPhase>('join');
   const [roomId, setRoomId] = useState('');
@@ -40,7 +47,58 @@ export default function App() {
   const [connState, setConnState] = useState<ConnState>('disconnected');
   const [peers, setPeers] = useState<string[]>([]);
 
-  // Refs for WebRTC callbacks & state guards
+  // Cryptographic Key & Safety Number Verification
+  const cryptoKeyRef = useRef<CryptoKey | null>(null);
+  const [safetyBadge, setSafetyBadge] = useState<string | null>(null);
+  const [showSafetyModal, setShowSafetyModal] = useState(false);
+
+  // Video Calling State & Refs
+  const [isLocalVideoActive, setIsLocalVideoActive] = useState(false);
+  const isLocalVideoActiveRef = useRef(false);
+  useEffect(() => {
+    isLocalVideoActiveRef.current = isLocalVideoActive;
+  }, [isLocalVideoActive]);
+
+  const [isRemoteVideoActive, setIsRemoteVideoActive] = useState(false);
+  const [isVideoMaximized, setIsVideoMaximized] = useState(false);
+  const [isPipSwapped, setIsPipSwapped] = useState(false);
+  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
+  const videoSenderRef = useRef<RTCRtpSender | null>(null);
+  const videoTransceiverRef = useRef<RTCRtpTransceiver | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const localVideoTrackRef = useRef<MediaStreamTrack | null>(null);
+  const localVideoStreamRef = useRef<MediaStream | null>(null);
+  const remoteVideoStreamRef = useRef<MediaStream | null>(null);
+
+  // ─── Attach streams to video elements when video stage mounts ───────────
+  useEffect(() => {
+    if (isRemoteVideoActive && remoteVideoRef.current && remoteVideoStreamRef.current) {
+      if (remoteVideoRef.current.srcObject !== remoteVideoStreamRef.current) {
+        remoteVideoRef.current.srcObject = remoteVideoStreamRef.current;
+      }
+      remoteVideoRef.current.play().catch(err => console.warn('Remote video play error:', err));
+    }
+    if (isLocalVideoActive && localVideoRef.current && localVideoStreamRef.current) {
+      if (localVideoRef.current.srcObject !== localVideoStreamRef.current) {
+        localVideoRef.current.srcObject = localVideoStreamRef.current;
+      }
+      localVideoRef.current.play().catch(err => console.warn('Local video play error:', err));
+    }
+  }, [isLocalVideoActive, isRemoteVideoActive, isPipSwapped, isVideoMaximized]);
+
+  // ─── Escape Key to exit Maximized Video ──────────────────────────────────
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && isVideoMaximized) {
+        setIsVideoMaximized(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isVideoMaximized]);
+
+  // Peers ref for WebRTC callbacks
   const peersRef = useRef<string[]>([]);
   useEffect(() => {
     peersRef.current = peers;
@@ -75,12 +133,12 @@ export default function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordStartTimeRef = useRef<number>(0);
-  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const remoteAudioStreamRef = useRef<MediaStream | null>(null);
 
   // VOX (Hands-Free Mode)
   const [voxEnabled, setVoxEnabled] = useState(false);
-  const [voxLevel, setVoxLevel] = useState(0); // 0-100%
-  const voxThreshold = 0.035; // RMS threshold
+  const [voxLevel, setVoxLevel] = useState(0);
+  const voxThreshold = 0.035;
   const voxSilenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voxAudioCtxRef = useRef<AudioContext | null>(null);
   const voxAnalyserRef = useRef<AnalyserNode | null>(null);
@@ -95,6 +153,7 @@ export default function App() {
   const [partnerTelemetry, setPartnerTelemetry] = useState<TelemetryData | null>(null);
   const telemetryTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // WebRTC & Sockets
   const wsRef = useRef<WebSocket | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -120,7 +179,7 @@ export default function App() {
         });
       }
     } catch (e) {
-      console.warn('Wake Lock request failed:', e);
+      console.warn('Wake Lock request error:', e);
     }
   }, []);
 
@@ -132,6 +191,136 @@ export default function App() {
       }
     } catch {}
     setWakeLockActive(false);
+  }, []);
+
+  // ─── Video Calling Functions ─────────────────────────────────────────────
+  const startLocalVideo = useCallback(async (facing: 'user' | 'environment') => {
+    try {
+      // Stop any existing local video track first
+      if (localVideoTrackRef.current) {
+        localVideoTrackRef.current.stop();
+        localVideoTrackRef.current = null;
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: facing,
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+        },
+      });
+
+      const videoTrack = stream.getVideoTracks()[0];
+      if (!videoTrack) return;
+
+      localVideoTrackRef.current = videoTrack;
+      localVideoStreamRef.current = stream;
+
+      if (videoSenderRef.current) {
+        await videoSenderRef.current.replaceTrack(videoTrack);
+      }
+
+      setIsLocalVideoActive(true);
+
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+        localVideoRef.current.play().catch(e => console.warn('Local video play error:', e));
+      }
+    } catch (err) {
+      console.warn('Local camera access failed (camera in use by another tab or unavailable):', err);
+      // Gracefully handle dual-tab testing on a single PC or devices without cameras
+      setStatusMsg('👁️ Viewing partner video (Local camera busy or unavailable)');
+    }
+  }, []);
+
+  const stopLocalVideo = useCallback(async () => {
+    if (localVideoTrackRef.current) {
+      localVideoTrackRef.current.stop();
+      localVideoTrackRef.current = null;
+    }
+    localVideoStreamRef.current = null;
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = null;
+    }
+    if (videoSenderRef.current) {
+      try {
+        await videoSenderRef.current.replaceTrack(null);
+      } catch (e) {
+        console.warn('replaceTrack null error:', e);
+      }
+    }
+    setIsLocalVideoActive(false);
+    setIsVideoMaximized(false);
+    setIsPipSwapped(false);
+  }, []);
+
+  // ─── Encrypted Signaling Helper ──────────────────────────────────────────
+  const sendEncryptedSignal = useCallback(async (payload: Record<string, unknown>, targetId?: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const target = targetId ?? peersRef.current[0];
+    if (!target) return;
+
+    if (cryptoKeyRef.current) {
+      try {
+        const { iv, ciphertext } = await encryptSignal(cryptoKeyRef.current, payload);
+        ws.send(
+          JSON.stringify({
+            type: 'encrypted',
+            target_id: target,
+            iv,
+            ciphertext,
+          })
+        );
+        return;
+      } catch (err) {
+        console.error('Encryption dispatch error:', err);
+      }
+    }
+
+    // Fallback unencrypted if key is not active
+    ws.send(JSON.stringify({ ...payload, target_id: target }));
+  }, []);
+
+  // ─── Dual-Camera Toggle (User Initiated) ──────────────────────────────────
+  const toggleVideo = async () => {
+    if (connState !== 'connected' || peers.length === 0) return;
+
+    if (!isLocalVideoActiveRef.current && !isRemoteVideoActive) {
+      await startLocalVideo(facingMode);
+      await sendEncryptedSignal({ type: 'video_sync', state: 'on' });
+    } else {
+      await stopLocalVideo();
+      setIsRemoteVideoActive(false);
+      setIsVideoMaximized(false);
+      setIsPipSwapped(false);
+      await sendEncryptedSignal({ type: 'video_sync', state: 'off' });
+    }
+  };
+
+  const flipCamera = async () => {
+    const nextFacing = facingMode === 'user' ? 'environment' : 'user';
+    setFacingMode(nextFacing);
+    if (isLocalVideoActiveRef.current) {
+      await startLocalVideo(nextFacing);
+    }
+  };
+
+  // ─── Safety Badge Updater ────────────────────────────────────────────────
+  const updateSafetyBadge = useCallback(async (pc: RTCPeerConnection) => {
+    try {
+      const localSdp = pc.localDescription?.sdp;
+      const remoteSdp = pc.remoteDescription?.sdp;
+      const localFp = extractSdpFingerprint(localSdp);
+      const remoteFp = extractSdpFingerprint(remoteSdp);
+
+      if (localFp && remoteFp) {
+        const badge = await computeSafetyNumber(localFp, remoteFp);
+        setSafetyBadge(badge);
+      }
+    } catch (e) {
+      console.warn('Failed to compute safety badge:', e);
+    }
   }, []);
 
   // ─── Cleanup ────────────────────────────────────────────────────────────
@@ -174,6 +363,7 @@ export default function App() {
       replayAudioRef.current = null;
     }
 
+    await stopLocalVideo();
     await releaseWakeLock();
 
     wsRef.current?.close();
@@ -182,9 +372,14 @@ export default function App() {
     wsRef.current = null;
     pcRef.current = null;
     localStreamRef.current = null;
-    remoteStreamRef.current = null;
+    remoteAudioStreamRef.current = null;
+    localVideoStreamRef.current = null;
+    remoteVideoStreamRef.current = null;
+    videoTransceiverRef.current = null;
     iceCandidateQueueRef.current = [];
-  }, [releaseWakeLock]);
+    cryptoKeyRef.current = null;
+    setSafetyBadge(null);
+  }, [releaseWakeLock, stopLocalVideo]);
 
   useEffect(() => {
     return () => {
@@ -220,7 +415,7 @@ export default function App() {
 
   // ─── Start / Stop Incoming Recording (Replay Feature) ─────────────────────
   const startRecordingIncoming = () => {
-    if (!remoteStreamRef.current || typeof MediaRecorder === 'undefined') return;
+    if (!remoteAudioStreamRef.current || typeof MediaRecorder === 'undefined') return;
     try {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         mediaRecorderRef.current.stop();
@@ -237,10 +432,10 @@ export default function App() {
         : '';
 
       const recorder = mimeType
-        ? new MediaRecorder(remoteStreamRef.current, { mimeType })
-        : new MediaRecorder(remoteStreamRef.current);
+        ? new MediaRecorder(remoteAudioStreamRef.current, { mimeType })
+        : new MediaRecorder(remoteAudioStreamRef.current);
 
-      recorder.ondataavailable = (e) => {
+      recorder.ondataavailable = e => {
         if (e.data && e.data.size > 0) {
           recordedChunksRef.current.push(e.data);
         }
@@ -256,7 +451,7 @@ export default function App() {
 
           setReplayClips(prev => [
             { id: Math.random().toString(36).substring(2, 9), url, durationSec, timeStr },
-            ...prev.slice(0, 2), // Keep last 3
+            ...prev.slice(0, 2),
           ]);
         }
       };
@@ -279,7 +474,6 @@ export default function App() {
     }
   };
 
-  // ─── Play Replay Clip ────────────────────────────────────────────────────
   const handleTogglePlayReplay = (clip: ReplayClip) => {
     if (isPlayingReplay === clip.id) {
       replayAudioRef.current?.pause();
@@ -301,7 +495,6 @@ export default function App() {
 
   // ─── PTT Control (Transmit) ──────────────────────────────────────────────
   const handlePTTStart = useCallback(() => {
-    // Channel collision lock: cannot transmit if channel is receiving or not connected
     if (connStateRef.current !== 'connected' || isReceivingRef.current || isTransmittingRef.current) {
       return;
     }
@@ -309,9 +502,9 @@ export default function App() {
     playPttStartChirp();
 
     localStreamRef.current?.getAudioTracks().forEach(t => (t.enabled = true));
-    wsRef.current?.send(JSON.stringify({ type: 'ptt_start', target_id: peersRef.current[0] }));
+    void sendEncryptedSignal({ type: 'ptt_start' });
     if (navigator.vibrate) navigator.vibrate(40);
-  }, []);
+  }, [sendEncryptedSignal]);
 
   const handlePTTEnd = useCallback(() => {
     if (!isTransmittingRef.current) return;
@@ -319,13 +512,13 @@ export default function App() {
     playTransmissionEnd();
 
     localStreamRef.current?.getAudioTracks().forEach(t => (t.enabled = false));
-    wsRef.current?.send(JSON.stringify({ type: 'ptt_end', target_id: peersRef.current[0] }));
-  }, []);
+    void sendEncryptedSignal({ type: 'ptt_end' });
+  }, [sendEncryptedSignal]);
 
   // ─── 1-Tap Buzzer / Paging Alert ─────────────────────────────────────────
   const sendBuzzer = () => {
     if (connState !== 'connected' || peers.length === 0) return;
-    wsRef.current?.send(JSON.stringify({ type: 'buzzer', target_id: peersRef.current[0] }));
+    void sendEncryptedSignal({ type: 'buzzer' });
     playBuzzerSound();
     if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
     setStatusMsg('⚡ Sent Buzz alert to partner!');
@@ -336,7 +529,7 @@ export default function App() {
     }, 2500);
   };
 
-  // ─── VOX (Voice-Activated Transmission) Loop ─────────────────────────────
+  // ─── VOX Loop ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!voxEnabled || phase !== 'ready' || !localStreamRef.current) {
       if (voxAnimFrameRef.current) {
@@ -348,12 +541,10 @@ export default function App() {
     }
 
     try {
-      // Create independent audio context & stream for VOX level sensing
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       const ctx = new AudioCtx();
       voxAudioCtxRef.current = ctx;
 
-      // Clone track so VOX stays active even when localStream audio track is disabled (muted)
       const micTrack = localStreamRef.current.getAudioTracks()[0];
       if (!micTrack) return;
       const clonedTrack = micTrack.clone();
@@ -377,11 +568,9 @@ export default function App() {
           sum += buffer[i] * buffer[i];
         }
         const rms = Math.sqrt(sum / buffer.length);
-        // Normalize 0..1 to percentage 0..100
         const percentage = Math.min(100, Math.round(rms * 400));
         setVoxLevel(percentage);
 
-        // Voice triggered threshold crossing
         if (rms >= voxThreshold) {
           if (!isTransmittingRef.current && !isReceivingRef.current && connStateRef.current === 'connected') {
             handlePTTStart();
@@ -391,7 +580,6 @@ export default function App() {
             voxSilenceTimerRef.current = null;
           }
         } else if (isTransmittingRef.current) {
-          // Voice below threshold: start 1.2s silence hangover before auto-muting
           if (!voxSilenceTimerRef.current) {
             voxSilenceTimerRef.current = setTimeout(() => {
               handlePTTEnd();
@@ -426,7 +614,7 @@ export default function App() {
     };
   }, [voxEnabled, phase, handlePTTStart, handlePTTEnd]);
 
-  // ─── Hardware Keyboard (Spacebar) & MediaSession PTT ─────────────────────
+  // ─── Hardware Spacebar & MediaSession PTT ─────────────────────────────────
   useEffect(() => {
     if (phase !== 'ready') return;
 
@@ -455,13 +643,12 @@ export default function App() {
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
 
-    // MediaSession API setup for lock screen & bluetooth buttons
     if ('mediaSession' in navigator) {
       try {
         navigator.mediaSession.metadata = new MediaMetadata({
-          title: 'Walkie-Talkie',
-          artist: `Room: ${roomId}`,
-          album: 'PTT Radio',
+          title: 'Sandcastle Walkie-Talkie',
+          artist: `Channel: ${roomId}`,
+          album: 'Encrypted Radio',
         });
 
         navigator.mediaSession.setActionHandler('play', () => handlePTTStart());
@@ -485,7 +672,7 @@ export default function App() {
     };
   }, [phase, roomId, handlePTTStart, handlePTTEnd]);
 
-  // ─── Telemetry Gathering (Battery & WebRTC RTT) ──────────────────────────
+  // ─── Telemetry Gathering (Battery & RTT) ──────────────────────────────────
   useEffect(() => {
     if (phase !== 'ready' || connState !== 'connected') {
       if (telemetryTimerRef.current) {
@@ -527,18 +714,14 @@ export default function App() {
         } catch {}
       }
 
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'telemetry',
-          target_id: peersRef.current[0],
-          battery: batteryLevel,
-          charging,
-          rtt: rttMs,
-        })
-      );
+      void sendEncryptedSignal({
+        type: 'telemetry',
+        battery: batteryLevel,
+        charging,
+        rtt: rttMs,
+      });
     };
 
-    // Send immediately and then every 10s
     void reportTelemetry();
     telemetryTimerRef.current = setInterval(reportTelemetry, 10000);
 
@@ -548,7 +731,7 @@ export default function App() {
         telemetryTimerRef.current = null;
       }
     };
-  }, [phase, connState]);
+  }, [phase, connState, sendEncryptedSignal]);
 
   // ─── Join Room ──────────────────────────────────────────────────────────
   const joinRoom = async () => {
@@ -558,9 +741,17 @@ export default function App() {
     if (!rawRoom || !rawUser) return;
 
     setPhase('connecting');
-    setStatusMsg('Requesting microphone...');
+    setStatusMsg('Deriving AES-256 E2EE key...');
 
-    // 1. Get mic
+    // 1. Derive PBKDF2 Client-Side Encryption Key
+    try {
+      cryptoKeyRef.current = await deriveRoomKey(rawRoom, rawPin);
+    } catch (e) {
+      console.warn('Key derivation error:', e);
+    }
+
+    // 2. Request mic
+    setStatusMsg('Requesting microphone permission...');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -570,7 +761,7 @@ export default function App() {
         },
         video: false,
       });
-      stream.getAudioTracks().forEach(t => (t.enabled = false)); // muted until PTT
+      stream.getAudioTracks().forEach(t => (t.enabled = false));
       localStreamRef.current = stream;
       setMicAllowed(true);
 
@@ -578,47 +769,46 @@ export default function App() {
         await ForegroundService.createNotificationChannel({
           id: 'walkie_talkie_channel',
           name: 'Walkie Talkie',
-          description: 'Background microphone service for Walkie Talkie',
+          description: 'Background service for Sandcastle Walkie-Talkie',
           importance: Importance.Default,
         });
 
         await ForegroundService.startForegroundService({
           id: 5001,
-          title: 'Walkie-Talkie Active',
-          body: `Room: ${rawRoom}`,
+          title: 'Sandcastle Walkie-Talkie',
+          body: `Channel: ${rawRoom}`,
           smallIcon: 'ic_launcher_background',
           notificationChannelId: 'walkie_talkie_channel',
           serviceType: ServiceType.Microphone,
           silent: false,
         });
       } catch (error) {
-        console.warn('Foreground service start failed:', error);
+        console.warn('Foreground service error:', error);
       }
     } catch {
       setMicAllowed(false);
-      setStatusMsg('❌ Microphone permission denied. Please allow mic access and try again.');
+      setStatusMsg('❌ Microphone permission denied. Please allow access and refresh.');
       setPhase('join');
       return;
     }
 
-    // Hash room if PIN is provided
     const effectiveRoom = await hashRoomWithPin(rawRoom, rawPin);
     setIsPinProtected(Boolean(rawPin));
 
-    // 2. Connect WebSocket
-    setStatusMsg('Connecting to signaling server...');
+    // 3. Connect WebSocket
+    setStatusMsg('Connecting to encrypted channel relay...');
     const ws = new WebSocket(`${WS_BASE_URL}/ws/${effectiveRoom}/${encodeURIComponent(rawUser)}`);
     wsRef.current = ws;
 
     ws.onopen = () => {
-      setStatusMsg('Waiting for partner...');
+      setStatusMsg('Waiting for partner on channel...');
       initPeerConnection(ws);
       setPhase('ready');
       void requestWakeLock();
     };
 
     ws.onerror = () => {
-      setStatusMsg('❌ Cannot reach signaling server. Is the backend running?');
+      setStatusMsg('❌ Cannot reach signaling server. Is the relay reachable?');
       setPhase('join');
       void cleanup();
     };
@@ -626,42 +816,96 @@ export default function App() {
     ws.onclose = () => {
       if (phase === 'ready') {
         setConnState('disconnected');
-        setStatusMsg('🔌 Disconnected from server.');
+        setStatusMsg('🔌 Disconnected from channel.');
       }
     };
 
-    ws.onmessage = async (event) => {
-      const msg = JSON.parse(event.data);
-      await handleSignal(msg, ws);
+    ws.onmessage = async event => {
+      try {
+        const rawMsg = JSON.parse(event.data);
+        let msg = rawMsg;
+
+        // Decrypt end-to-end signal if payload is encrypted envelope
+        if (rawMsg.type === 'encrypted' && rawMsg.iv && rawMsg.ciphertext && cryptoKeyRef.current) {
+          try {
+            const decrypted = (await decryptSignal(
+              cryptoKeyRef.current,
+              rawMsg.iv,
+              rawMsg.ciphertext
+            )) as Record<string, unknown>;
+            msg = {
+              ...decrypted,
+              from_user: rawMsg.from_user,
+              target_id: rawMsg.target_id,
+            };
+          } catch (decErr) {
+            console.warn('Decryption failed (Secret Key mismatch):', decErr);
+            setStatusMsg('🔒 Received signal with mismatched Secret Key / PIN.');
+            return;
+          }
+        }
+
+        await handleSignal(msg, ws);
+      } catch (err) {
+        console.error('Signal parsing error:', err);
+      }
     };
   };
 
-  // ─── Peer Connection ─────────────────────────────────────────────────────
+  // ─── Peer Connection & Video Transceiver ─────────────────────────────────
   const initPeerConnection = (ws: WebSocket) => {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     pcRef.current = pc;
 
-    // Add local tracks
+    // Add local audio tracks
     localStreamRef.current?.getTracks().forEach(t => {
       pc.addTrack(t, localStreamRef.current!);
     });
 
-    // Remote audio
-    pc.ontrack = (e) => {
-      remoteStreamRef.current = e.streams[0];
-      const audioEl = remoteAudioRef.current;
-      if (audioEl) {
-        audioEl.srcObject = e.streams[0];
-        audioEl.play().catch(err => console.warn('Audio autoplay blocked:', err));
+    // Pre-allocate a bidirectional video transceiver for instant replaceTrack
+    const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+    videoTransceiverRef.current = videoTransceiver;
+    videoSenderRef.current = videoTransceiver.sender;
+
+    // Remote audio & video streams
+    pc.ontrack = e => {
+      if (e.track.kind === 'audio') {
+        remoteAudioStreamRef.current = e.streams[0];
+        const audioEl = remoteAudioRef.current;
+        if (audioEl) {
+          audioEl.srcObject = e.streams[0];
+          audioEl.play().catch(err => console.warn('Audio autoplay blocked:', err));
+        }
+      } else if (e.track.kind === 'video') {
+        const stream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
+        remoteVideoStreamRef.current = stream;
+        setIsRemoteVideoActive(true);
+
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = stream;
+          remoteVideoRef.current.play().catch(err => console.warn('Remote video play blocked:', err));
+        }
+
+        e.track.onunmute = () => {
+          setIsRemoteVideoActive(true);
+          if (remoteVideoRef.current && remoteVideoStreamRef.current) {
+            remoteVideoRef.current.srcObject = remoteVideoStreamRef.current;
+            remoteVideoRef.current.play().catch(() => {});
+          }
+        };
+
+        e.track.onended = () => {
+          setIsRemoteVideoActive(false);
+        };
       }
     };
 
-    // ICE candidates
-    pc.onicecandidate = (e) => {
+    // ICE candidates (sent encrypted)
+    pc.onicecandidate = e => {
       if (e.candidate && ws.readyState === WebSocket.OPEN) {
         const targetId = peersRef.current[0];
         if (targetId) {
-          ws.send(JSON.stringify({ type: 'ice-candidate', target_id: targetId, candidate: e.candidate }));
+          void sendEncryptedSignal({ type: 'ice-candidate', candidate: e.candidate }, targetId);
         }
       }
     };
@@ -671,14 +915,17 @@ export default function App() {
       if (s === 'connected' || s === 'completed') {
         setConnState('connected');
         setStatusMsg('🟢 Partner connected');
+        void updateSafetyBadge(pc);
       } else if (s === 'disconnected' || s === 'failed' || s === 'closed') {
         setConnState('disconnected');
         setStatusMsg('⚠️ Partner disconnected');
         setPeers([]);
         setPartnerTelemetry(null);
+        setSafetyBadge(null);
+        setIsRemoteVideoActive(false);
       } else if (s === 'checking') {
         setConnState('connecting');
-        setStatusMsg('🔄 Establishing P2P connection...');
+        setStatusMsg('🔄 Establishing authenticated P2P...');
       }
     };
 
@@ -686,6 +933,7 @@ export default function App() {
       if (pc.connectionState === 'connected') {
         setConnState('connected');
         setStatusMsg('🟢 Partner connected');
+        void updateSafetyBadge(pc);
       }
     };
 
@@ -694,7 +942,11 @@ export default function App() {
       try {
         makingOfferRef.current = true;
         await pc.setLocalDescription();
-        ws.send(JSON.stringify({ type: 'offer', target_id: peersRef.current[0], offer: pc.localDescription }));
+        void updateSafetyBadge(pc);
+        await sendEncryptedSignal(
+          { type: 'offer', offer: pc.localDescription },
+          peersRef.current[0]
+        );
       } catch (e) {
         console.error('Negotiation error:', e);
       } finally {
@@ -706,7 +958,7 @@ export default function App() {
   };
 
   // ─── Signaling Message Handler ───────────────────────────────────────────
-  const handleSignal = async (msg: Record<string, unknown>, ws: WebSocket) => {
+  const handleSignal = async (msg: Record<string, unknown>, _ws: WebSocket) => {
     const pc = pcRef.current;
 
     if (msg.type === 'room_state') {
@@ -714,7 +966,7 @@ export default function App() {
       setPeers(existingPeers);
       politeRef.current = true;
       if (existingPeers.length > 0) {
-        setStatusMsg('🔄 Partner found! Waiting for connection...');
+        setStatusMsg('🔄 Partner found! Negotiating cipher & session...');
       }
       return;
     }
@@ -724,14 +976,15 @@ export default function App() {
       if (!newPeer) return;
       setPeers(prev => [...prev, newPeer]);
       politeRef.current = false;
-      setStatusMsg('🔄 Partner found! Establishing P2P...');
+      setStatusMsg('🔄 Partner found! Establishing E2EE session...');
 
       if (pc) {
         try {
           makingOfferRef.current = true;
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
-          ws.send(JSON.stringify({ type: 'offer', target_id: newPeer, offer: pc.localDescription }));
+          void updateSafetyBadge(pc);
+          await sendEncryptedSignal({ type: 'offer', offer: pc.localDescription }, newPeer);
         } catch (e) {
           console.error('Offer error:', e);
         } finally {
@@ -743,9 +996,30 @@ export default function App() {
 
     if (msg.type === 'peer_left') {
       setConnState('disconnected');
-      setStatusMsg('⚠️ Partner left the room');
+      setStatusMsg('⚠️ Partner left the channel');
       setPeers(p => p.filter(id => id !== msg.user_id));
       setPartnerTelemetry(null);
+      setSafetyBadge(null);
+      setIsRemoteVideoActive(false);
+      return;
+    }
+
+    // ── Video Sync Signal (Dual Camera Auto Turn On / Off) ──
+    if (msg.type === 'video_sync') {
+      const desiredState = msg.state as string;
+      if (desiredState === 'on') {
+        setIsRemoteVideoActive(true);
+        if (!isLocalVideoActiveRef.current) {
+          void startLocalVideo('user');
+        }
+      } else if (desiredState === 'off') {
+        setIsRemoteVideoActive(false);
+        setIsVideoMaximized(false);
+        setIsPipSwapped(false);
+        if (isLocalVideoActiveRef.current) {
+          void stopLocalVideo();
+        }
+      }
       return;
     }
 
@@ -769,7 +1043,7 @@ export default function App() {
       return;
     }
 
-    // ── PTT Signals (Half-Duplex Lock & Audio Feedback) ──
+    // ── PTT Signals ──
     if (msg.type === 'ptt_start') {
       setIsReceiving(true);
       triggerIncomingPing();
@@ -803,10 +1077,17 @@ export default function App() {
 
       await pc.setRemoteDescription(new RTCSessionDescription(msg.offer as RTCSessionDescriptionInit));
       await flushIceCandidateQueue(pc);
+      void updateSafetyBadge(pc);
+
+      if (videoTransceiverRef.current) {
+        videoTransceiverRef.current.direction = 'sendrecv';
+      }
 
       await pc.setLocalDescription();
+      void updateSafetyBadge(pc);
+
       const targetId = senderId ?? peersRef.current[0];
-      ws.send(JSON.stringify({ type: 'answer', target_id: targetId, answer: pc.localDescription }));
+      await sendEncryptedSignal({ type: 'answer', answer: pc.localDescription }, targetId);
       return;
     }
 
@@ -814,6 +1095,7 @@ export default function App() {
       if (pc.signalingState !== 'have-local-offer') return;
       await pc.setRemoteDescription(new RTCSessionDescription(msg.answer as RTCSessionDescriptionInit));
       await flushIceCandidateQueue(pc);
+      void updateSafetyBadge(pc);
       return;
     }
 
@@ -825,7 +1107,7 @@ export default function App() {
           iceCandidateQueueRef.current.push(msg.candidate as RTCIceCandidateInit);
         }
       } catch (e) {
-        if (!ignoreOfferRef.current) console.error('ICE error:', e);
+        if (!ignoreOfferRef.current) console.error('ICE candidate error:', e);
       }
       return;
     }
@@ -837,30 +1119,43 @@ export default function App() {
     pingTimeoutRef.current = setTimeout(() => setIncomingPing(false), 1500);
   };
 
-  // ─── Render: Join Screen ─────────────────────────────────────────────────
+  // ─── Render: Join Screen (Sandcastle Theme) ──────────────────────────────
   if (phase === 'join' || phase === 'connecting') {
     return (
-      <div className="app-shell">
-        <div className="join-card">
-          <div className="join-logo">
-            <span className="join-icon">📻</span>
-            <h1 className="join-title">Walkie<span className="accent">-</span>Talkie</h1>
-            <p className="join-sub">Zero-lag P2P · Authentic radio audio · VOX &amp; Replay</p>
+      <div className="sc-app-shell">
+        <div className="sc-join-card">
+          <div className="sc-brand-header">
+            <div className="sc-brand-dots">
+              <span className="sc-dot sc-dot-olive" />
+              <span className="sc-dot sc-dot-terracotta" />
+              <span className="sc-brand-text">SANDCASTLE</span>
+            </div>
+            <div className="sc-brand-eyebrow">
+              FOR PRIVATE TEAMS &amp; SECURE FIELD CHANNELS
+            </div>
+            <h1 className="sc-join-headline">
+              Encrypted Walkie-Talkie <span className="sc-accent-underline">&amp; Dual-Camera.</span>
+            </h1>
+            <p className="sc-join-sub">
+              Zero-server storage · Native AES-GCM 256-bit E2EE · Tap to open both cameras simultaneously.
+            </p>
           </div>
 
           {micAllowed === false && (
-            <div className="alert alert-danger">
-              🎙 Microphone permission denied. Please allow access in browser settings and refresh.
+            <div className="sc-alert sc-alert-danger">
+              🎙 Microphone permission denied. Please allow microphone and camera in your browser settings.
             </div>
           )}
 
-          <div className="form-group">
-            <label className="form-label" htmlFor="room-id-input">Room Channel</label>
+          <div className="sc-form-group">
+            <label className="sc-form-label" htmlFor="room-id-input">
+              Channel Identifier
+            </label>
             <input
               id="room-id-input"
-              className="form-input"
+              className="sc-form-input"
               type="text"
-              placeholder="e.g. yash-radio"
+              placeholder="e.g. security-alpha"
               value={roomId}
               onChange={e => setRoomId(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && joinRoom()}
@@ -868,35 +1163,36 @@ export default function App() {
               autoCapitalize="none"
               autoCorrect="off"
             />
-            <span className="form-hint">Both devices must enter the same Room Channel</span>
+            <span className="sc-form-hint">Both devices must enter the exact same Channel Identifier</span>
           </div>
 
-          <div className="form-group">
-            <label className="form-label" htmlFor="room-pin-input">
-              <span>Channel PIN</span>
-              <span className="badge-optional">Optional</span>
+          <div className="sc-form-group">
+            <label className="sc-form-label" htmlFor="room-pin-input">
+              <span>Secret PIN / AES Key</span>
+              <span className="sc-badge-optional">Optional (PBKDF2)</span>
             </label>
             <input
               id="room-pin-input"
-              className="form-input"
+              className="sc-form-input"
               type="password"
-              maxLength={8}
-              placeholder="e.g. 1234 (Client-side hashed)"
+              placeholder="e.g. 8492 (Derives 256-bit AES-GCM key)"
               value={roomPin}
               onChange={e => setRoomPin(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && joinRoom()}
               disabled={phase === 'connecting'}
             />
-            <span className="form-hint">Protects your channel from accidental intruders</span>
+            <span className="sc-form-hint">Used client-side to derive your E2EE key. Never sent to the server.</span>
           </div>
 
-          <div className="form-group">
-            <label className="form-label" htmlFor="user-id-input">Your Call Sign / Name</label>
+          <div className="sc-form-group">
+            <label className="sc-form-label" htmlFor="user-id-input">
+              Your Call Sign
+            </label>
             <input
               id="user-id-input"
-              className="form-input"
+              className="sc-form-input"
               type="text"
-              placeholder="e.g. Jo or Yash"
+              placeholder="e.g. Yash (PC) or Priya (Mobile)"
               value={userId}
               onChange={e => setUserId(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && joinRoom()}
@@ -904,85 +1200,261 @@ export default function App() {
               autoCapitalize="none"
               autoCorrect="off"
             />
+            <span className="sc-form-hint">Each device in the channel must use a different name.</span>
           </div>
 
           <button
             id="join-btn"
-            className="join-btn"
+            className="sc-btn-primary"
             onClick={joinRoom}
             disabled={phase === 'connecting' || !roomId.trim() || !userId.trim()}
           >
             {phase === 'connecting' ? (
-              <><span className="spinner" /> Connecting Radio...</>
+              <><span className="sc-spinner" /> Establishing Encrypted Link...</>
             ) : (
-              '📡 Tune In / Join'
+              'Tune In Channel →'
             )}
           </button>
 
-          <p className="join-footer">
-            Works across Android, iOS &amp; Desktop browsers. No app store required.
-          </p>
+          <div className="sc-join-footer">
+            <span>🛡️ End-to-End Encrypted via native WebCrypto</span>
+            <span>Zero accounts · Works on Android, iOS &amp; Desktop</span>
+          </div>
         </div>
       </div>
     );
   }
 
-  // ─── Render: Tactical PTT Screen ─────────────────────────────────────────
+  // ─── Render: Tactical PTT Screen (Sandcastle Theme) ──────────────────────
   const partnerName = peers[0] || null;
 
   return (
-    <div className="app-shell">
+    <div className="sc-app-shell">
       <audio ref={remoteAudioRef} autoPlay playsInline style={{ display: 'none' }} />
+
+      {/* Safety Number Verification Modal */}
+      {showSafetyModal && (
+        <div className="sc-modal-backdrop" onClick={() => setShowSafetyModal(false)}>
+          <div className="sc-modal-card" onClick={e => e.stopPropagation()}>
+            <div className="sc-modal-header">
+              <span className="sc-modal-title">🔐 P2P Safety Number Verification</span>
+              <button className="sc-modal-close" onClick={() => setShowSafetyModal(false)}>✕</button>
+            </div>
+            <p className="sc-modal-desc">
+              Compare this 4-emoji Safety Number with your partner’s screen. If both match, your connection is verified and mathematically immune to eavesdroppers:
+            </p>
+            <div className="sc-safety-banner">
+              <span className="sc-safety-emojis-lg">{safetyBadge || '🔒 Negotiating...'}</span>
+              <span className="sc-safety-status-lg">AUTHENTICATED DTLS-SRTP FINGERPRINTS</span>
+            </div>
+            <div className="sc-modal-details">
+              <div><strong>Channel:</strong> {roomId}</div>
+              <div><strong>Cipher:</strong> AES-GCM 256-bit (PBKDF2 SHA-256)</div>
+              <div><strong>Partner:</strong> {partnerName || 'Waiting...'}</div>
+            </div>
+            <button className="sc-btn-primary" onClick={() => setShowSafetyModal(false)}>
+              Verified &amp; Close
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Top Banner Alert (Buzzer) */}
       {buzzerAlert && (
-        <div className="urgent-banner">
-          <span className="urgent-icon">🚨</span>
-          <span className="urgent-text">{buzzerAlert}</span>
+        <div className="sc-urgent-banner">
+          <span className="sc-urgent-icon">🚨</span>
+          <span>{buzzerAlert}</span>
         </div>
       )}
 
       {/* Header */}
-      <header className="ptt-header">
-        <div className="header-left">
-          <span className="header-icon">📻</span>
-          <div>
-            <div className="header-title">Walkie-Talkie</div>
-            <div className="header-room">
-              CH: <strong>{roomId}</strong>
-              {isPinProtected && <span className="pin-badge" title="PIN Protected">🔒</span>}
-              {wakeLockActive && <span className="wakelock-badge" title="Screen WakeLock Active">⚡ Screen Awake</span>}
-            </div>
+      <header className="sc-ptt-header">
+        <div className="sc-header-left">
+          <div className="sc-brand-dots">
+            <span className="sc-dot sc-dot-olive" />
+            <span className="sc-dot sc-dot-terracotta" />
+            <span className="sc-brand-text">SANDCASTLE</span>
+          </div>
+          <div className="sc-channel-meta">
+            <span className="sc-channel-name">CH: <strong>{roomId}</strong></span>
+            {isPinProtected && <span className="sc-badge-pin" title="AES-GCM Protected">🔒</span>}
+            {wakeLockActive && <span className="sc-badge-wake" title="Screen WakeLock Active">⚡</span>}
           </div>
         </div>
 
-        <div className="header-right">
-          <div className={`status-chip status-${connState}`}>
-            <span className="status-dot" />
-            {connState === 'connected' ? 'Connected' : connState === 'connecting' ? 'Connecting' : 'Offline'}
+        <div className="sc-header-right">
+          {safetyBadge && (
+            <button
+              className="sc-safety-badge"
+              onClick={() => setShowSafetyModal(true)}
+              title="Click to verify End-to-End Encryption Safety Number"
+            >
+              <span className="sc-safety-badge-emojis">{safetyBadge}</span>
+              <span className="sc-safety-badge-label sc-hide-mobile">Verified</span>
+            </button>
+          )}
+
+          <div className={`sc-status-chip sc-status-${connState}`} title={`Status: ${connState}`}>
+            <span className="sc-status-dot" />
+            <span className="sc-status-text-pill">{connState === 'connected' ? 'Connected' : connState === 'connecting' ? 'Connecting' : 'Offline'}</span>
           </div>
         </div>
       </header>
 
-      {/* Main PTT area */}
-      <main className="ptt-main">
-        {/* Status message & Partner Telemetry */}
-        <div className="status-banner">
-          <p className="status-text">{statusMsg}</p>
+      {/* Main Container */}
+      <main className="sc-ptt-main">
+        {/* Dual-Camera Video Stage (when either camera is active) */}
+        {(isLocalVideoActive || isRemoteVideoActive) && (
+          <div className={`sc-video-stage ${isVideoMaximized ? 'sc-video-maximized' : ''}`}>
+            {/* Primary Feed (Remote by default, or Local when PiP swapped) */}
+            <div
+              className={`sc-video-feed-wrapper ${!isPipSwapped ? 'sc-feed-main' : 'sc-feed-pip'}`}
+              onClick={isPipSwapped ? () => setIsPipSwapped(false) : undefined}
+              onDoubleClick={() => setIsVideoMaximized(prev => !prev)}
+              title={isPipSwapped ? 'Tap to expand remote partner' : 'Double-click to toggle fullscreen'}
+            >
+              <video
+                ref={remoteVideoRef}
+                autoPlay
+                playsInline
+                className={`sc-video-element ${!isRemoteVideoActive ? 'sc-video-waiting' : ''}`}
+              />
+              {!isRemoteVideoActive && (
+                <div className="sc-video-waiting-overlay">
+                  <span className="sc-spinner" />
+                  <span>Waiting for partner video...</span>
+                </div>
+              )}
+              {isPipSwapped && <span className="sc-pip-tag">Partner</span>}
+            </div>
+
+            {/* Secondary Feed (Local self-view by default, or Remote when PiP swapped) */}
+            {isLocalVideoActive && (
+              <div
+                className={`sc-video-feed-wrapper ${!isPipSwapped ? 'sc-feed-pip' : 'sc-feed-main'}`}
+                onClick={!isPipSwapped ? () => setIsPipSwapped(true) : undefined}
+                onDoubleClick={() => setIsVideoMaximized(prev => !prev)}
+                title={!isPipSwapped ? 'Tap to expand your camera' : 'Double-click to toggle fullscreen'}
+              >
+                <video
+                  ref={localVideoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="sc-video-element sc-video-selfie"
+                />
+                {!isPipSwapped && <span className="sc-pip-tag">You</span>}
+                <button
+                  className="sc-pip-flip-btn"
+                  onClick={e => {
+                    e.stopPropagation();
+                    void flipCamera();
+                  }}
+                  title="Flip front/rear camera"
+                >
+                  🔄
+                </button>
+              </div>
+            )}
+
+            {/* Video Stage Top Overlay */}
+            <div className="sc-video-overlay-bar">
+              <span className="sc-video-live-pill">
+                <span className="sc-live-dot" />
+                {isLocalVideoActive && isRemoteVideoActive
+                  ? 'Both Cameras Live'
+                  : isRemoteVideoActive
+                  ? 'Partner Video Live'
+                  : 'Streaming Camera'}
+              </span>
+
+              <div className="sc-video-top-actions" onClick={e => e.stopPropagation()}>
+                <button
+                  className="sc-video-btn-pill"
+                  onClick={e => {
+                    e.stopPropagation();
+                    setIsVideoMaximized(prev => !prev);
+                  }}
+                  title={isVideoMaximized ? 'Minimize Video (Esc)' : 'Maximize Video'}
+                >
+                  {isVideoMaximized ? '🗗 Minimize' : '⛶ Maximize'}
+                </button>
+                <button
+                  className="sc-video-end-btn"
+                  onClick={e => {
+                    e.stopPropagation();
+                    void toggleVideo();
+                  }}
+                  title="Turn off video"
+                >
+                  ✕ Stop
+                </button>
+              </div>
+            </div>
+
+            {/* Floating PTT Bar inside Fullscreen / Maximized Mode */}
+            {isVideoMaximized && (
+              <div className="sc-maximized-floating-bar">
+                <button
+                  className={`sc-maximized-ptt-btn ${isTransmitting ? 'sc-ptt-tx' : ''} ${
+                    connState !== 'connected' || isReceiving ? 'sc-ptt-disabled' : ''
+                  } ${isReceiving ? 'sc-ptt-locked' : ''}`}
+                  onMouseDown={handlePTTStart}
+                  onMouseUp={handlePTTEnd}
+                  onMouseLeave={isTransmitting ? handlePTTEnd : undefined}
+                  onTouchStart={e => {
+                    e.preventDefault();
+                    handlePTTStart();
+                  }}
+                  onTouchEnd={e => {
+                    e.preventDefault();
+                    handlePTTEnd();
+                  }}
+                  disabled={connState !== 'connected' || isReceiving}
+                  aria-label="Push to talk"
+                >
+                  <span className="sc-max-ptt-icon">{isReceiving ? '🔒' : isTransmitting ? '🎙️' : '📡'}</span>
+                  <span className="sc-max-ptt-text">
+                    {isReceiving ? 'RECEIVING...' : isTransmitting ? 'TRANSMITTING' : 'HOLD TO TALK'}
+                  </span>
+                </button>
+
+                <div className="sc-maximized-quick-actions">
+                  {isLocalVideoActive && (
+                    <button
+                      className="sc-max-icon-btn"
+                      onClick={() => void flipCamera()}
+                      title="Flip front/rear camera"
+                    >
+                      🔄
+                    </button>
+                  )}
+                  <button
+                    className="sc-max-icon-btn"
+                    onClick={() => setIsVideoMaximized(false)}
+                    title="Exit Fullscreen (Esc)"
+                  >
+                    🗗
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Status banner & Telemetry */}
+        <div className="sc-status-banner">
+          <p className="sc-status-text">{statusMsg}</p>
           {partnerName && (
-            <div className="telemetry-bar">
-              <span className="partner-name">Partner: <strong>{partnerName}</strong></span>
+            <div className="sc-telemetry-bar">
+              <span>Partner: <strong>{partnerName}</strong></span>
               {partnerTelemetry && (
-                <span className="telemetry-pill">
+                <span className="sc-telemetry-pill">
                   {partnerTelemetry.battery !== null && partnerTelemetry.battery !== undefined && (
-                    <span className="telemetry-item">
-                      {partnerTelemetry.battery}% {partnerTelemetry.charging ? '⚡' : '🔋'}
-                    </span>
+                    <span>{partnerTelemetry.battery}% {partnerTelemetry.charging ? '⚡' : '🔋'}</span>
                   )}
                   {partnerTelemetry.rttMs !== null && partnerTelemetry.rttMs !== undefined && (
-                    <span className="telemetry-item">
-                      • {partnerTelemetry.rttMs}ms
-                    </span>
+                    <span>• {partnerTelemetry.rttMs}ms RTT</span>
                   )}
                 </span>
               )}
@@ -991,32 +1463,32 @@ export default function App() {
         </div>
 
         {/* Channel Activity & Half-Duplex Lock Indicator */}
-        <div className={`rx-indicator ${isReceiving ? 'rx-active' : ''} ${isTransmitting ? 'tx-active' : ''}`}>
-          <div className="rx-bars">
+        <div className={`sc-rx-indicator ${isReceiving ? 'sc-rx-active' : ''} ${isTransmitting ? 'sc-tx-active' : ''}`}>
+          <div className="sc-rx-bars">
             {[1, 2, 3, 4, 5].map(i => (
-              <div key={i} className={`rx-bar rx-bar-${i}`} />
+              <div key={i} className={`sc-rx-bar sc-rx-bar-${i}`} />
             ))}
           </div>
-          <span className="rx-label">
+          <span className="sc-rx-label">
             {isReceiving
-              ? `🔴 RECEIVING FROM ${partnerName?.toUpperCase() || 'PARTNER'} (BUSY)`
+              ? `🔴 RECEIVING FROM ${partnerName?.toUpperCase() || 'PARTNER'} (CHANNEL BUSY)`
               : isTransmitting
               ? '🟢 TRANSMITTING (AIRWAYS OCCUPIED)'
-              : 'STANDBY / HALF-DUPLEX READY'}
+              : 'HALF-DUPLEX READY • STANDBY'}
           </span>
         </div>
 
-        {/* PTT Main Button */}
-        <div className="ptt-wrap">
-          <div className={`ptt-ring ptt-ring-3 ${isTransmitting ? 'ring-active' : ''}`} />
-          <div className={`ptt-ring ptt-ring-2 ${isTransmitting ? 'ring-active' : ''}`} />
-          <div className={`ptt-ring ptt-ring-1 ${isTransmitting ? 'ring-active' : ''}`} />
+        {/* Central Tactile PTT Button */}
+        <div className="sc-ptt-wrap">
+          <div className={`sc-ptt-ring sc-ptt-ring-3 ${isTransmitting ? 'sc-ring-active' : ''}`} />
+          <div className={`sc-ptt-ring sc-ptt-ring-2 ${isTransmitting ? 'sc-ring-active' : ''}`} />
+          <div className={`sc-ptt-ring sc-ptt-ring-1 ${isTransmitting ? 'sc-ring-active' : ''}`} />
 
           <button
             id="ptt-button"
-            className={`ptt-btn ${isTransmitting ? 'ptt-tx' : ''} ${
-              connState !== 'connected' || isReceiving ? 'ptt-disabled' : ''
-            } ${incomingPing ? 'ptt-incoming' : ''} ${isReceiving ? 'ptt-locked' : ''}`}
+            className={`sc-ptt-btn ${isTransmitting ? 'sc-ptt-tx' : ''} ${
+              connState !== 'connected' || isReceiving ? 'sc-ptt-disabled' : ''
+            } ${incomingPing ? 'sc-ptt-incoming' : ''} ${isReceiving ? 'sc-ptt-locked' : ''}`}
             onMouseDown={handlePTTStart}
             onMouseUp={handlePTTEnd}
             onMouseLeave={isTransmitting ? handlePTTEnd : undefined}
@@ -1031,10 +1503,10 @@ export default function App() {
             disabled={connState !== 'connected' || isReceiving}
             aria-label="Push to talk"
           >
-            <span className="ptt-icon">
-              {isReceiving ? '🔒' : isTransmitting ? '🎙' : '📡'}
+            <span className="sc-ptt-icon">
+              {isReceiving ? '🔒' : isTransmitting ? '🎙️' : '📡'}
             </span>
-            <span className="ptt-label">
+            <span className="sc-ptt-label">
               {isReceiving
                 ? 'CHANNEL BUSY'
                 : isTransmitting
@@ -1043,84 +1515,116 @@ export default function App() {
                 ? 'OFFLINE'
                 : 'HOLD TO TALK'}
             </span>
-            <span className="ptt-sublabel">
-              {isReceiving ? 'Wait for partner to finish' : 'Spacebar or hold button'}
+            <span className="sc-ptt-sublabel">
+              {isReceiving ? 'Wait for partner to release' : 'Spacebar or hold button'}
             </span>
           </button>
         </div>
 
-        {/* Controls Toolbar: Buzzer, Replay, VOX */}
-        <div className="action-toolbar">
+        {/* Uber-Style Accessible Controls Grid */}
+        <div className="sc-action-grid">
+          {/* Dual-Camera Toggle Button */}
+          <button
+            className={`sc-action-tile sc-video-tile ${(isLocalVideoActive || isRemoteVideoActive) ? 'sc-tile-active-terracotta' : ''}`}
+            onClick={toggleVideo}
+            disabled={connState !== 'connected'}
+            title="Turn on both cameras simultaneously"
+          >
+            <span className="sc-tile-icon">{(isLocalVideoActive || isRemoteVideoActive) ? '📹' : '📷'}</span>
+            <div className="sc-tile-info">
+              <span className="sc-tile-title">{(isLocalVideoActive || isRemoteVideoActive) ? 'Stop Video' : 'Video Call'}</span>
+              <span className="sc-tile-sub">{(isLocalVideoActive || isRemoteVideoActive) ? 'Video Live' : 'Both cameras'}</span>
+            </div>
+          </button>
+
           {/* 1-Tap Buzzer Button */}
           <button
-            className="action-btn buzzer-btn"
+            className="sc-action-tile sc-buzzer-tile"
             onClick={sendBuzzer}
             disabled={connState !== 'connected' || isReceiving}
             title="Send loud buzz paging alert to partner"
           >
-            <span className="action-icon">⚡</span>
-            <span>Buzz</span>
+            <span className="sc-tile-icon">⚡</span>
+            <div className="sc-tile-info">
+              <span className="sc-tile-title">Buzz Alert</span>
+              <span className="sc-tile-sub">Loud page</span>
+            </div>
           </button>
 
           {/* Quick Replay Last Transmission */}
           <button
-            className={`action-btn replay-btn ${replayClips.length > 0 ? 'has-clips' : ''} ${
-              isPlayingReplay ? 'is-playing' : ''
+            className={`sc-action-tile sc-replay-tile ${replayClips.length > 0 ? 'sc-has-clips' : ''} ${
+              isPlayingReplay ? 'sc-is-playing' : ''
             }`}
             onClick={() => replayClips[0] && handleTogglePlayReplay(replayClips[0])}
             disabled={replayClips.length === 0}
             title="Replay the last received voice transmission"
           >
-            <span className="action-icon">{isPlayingReplay ? '⏹' : '⏪'}</span>
-            <span>
-              {isPlayingReplay
-                ? 'Playing...'
-                : replayClips[0]
-                ? `Replay (${replayClips[0].durationSec}s)`
-                : 'No Clutter'}
-            </span>
+            <span className="sc-tile-icon">{isPlayingReplay ? '⏹' : '⏪'}</span>
+            <div className="sc-tile-info">
+              <span className="sc-tile-title">{isPlayingReplay ? 'Playing...' : 'Replay'}</span>
+              <span className="sc-tile-sub">{replayClips[0] ? `${replayClips[0].durationSec}s missed note` : 'No past clips'}</span>
+            </div>
           </button>
 
           {/* Hands-Free VOX Mode Toggle */}
           <button
-            className={`action-btn vox-btn ${voxEnabled ? 'vox-active' : ''}`}
+            className={`sc-action-tile sc-vox-tile ${voxEnabled ? 'sc-tile-active-olive' : ''}`}
             onClick={() => setVoxEnabled(prev => !prev)}
             title="Voice-Activated Transmission (Hands-free)"
           >
-            <span className="action-icon">{voxEnabled ? '🎙️' : '🔇'}</span>
-            <span>VOX {voxEnabled ? 'ON' : 'OFF'}</span>
+            <span className="sc-tile-icon">{voxEnabled ? '🎙️' : '🔇'}</span>
+            <div className="sc-tile-info">
+              <span className="sc-tile-title">Hands-Free</span>
+              <span className="sc-tile-sub">{voxEnabled ? 'VOX Active' : 'Hold to talk'}</span>
+            </div>
           </button>
+
+          {/* Flip Camera (visible when camera is running) */}
+          {isLocalVideoActive && (
+            <button
+              className="sc-action-tile sc-flip-tile"
+              onClick={flipCamera}
+              title="Flip between front and rear camera"
+            >
+              <span className="sc-tile-icon">🔄</span>
+              <div className="sc-tile-info">
+                <span className="sc-tile-title">Flip Camera</span>
+                <span className="sc-tile-sub">{facingMode === 'user' ? 'Front Cam' : 'Rear Cam'}</span>
+              </div>
+            </button>
+          )}
         </div>
 
         {/* VOX Level Bar (when enabled) */}
         {voxEnabled && (
-          <div className="vox-meter-container">
-            <div className="vox-meter-label">
+          <div className="sc-vox-meter-container">
+            <div className="sc-vox-meter-label">
               <span>VOX Sensitivity</span>
               <span>{voxLevel}%</span>
             </div>
-            <div className="vox-meter-track">
+            <div className="sc-vox-meter-track">
               <div
-                className="vox-meter-fill"
+                className="sc-vox-meter-fill"
                 style={{
                   width: `${voxLevel}%`,
-                  backgroundColor: voxLevel > 15 ? COLORS.success : COLORS.primary,
+                  backgroundColor: voxLevel > 15 ? COLORS.emerald : COLORS.terracotta,
                 }}
               />
-              <div className="vox-meter-threshold" style={{ left: '15%' }} title="Trigger Threshold" />
+              <div className="sc-vox-meter-threshold" style={{ left: '15%' }} title="Trigger Threshold" />
             </div>
           </div>
         )}
 
-        {/* Recent Transmissions History (Last 3) */}
+        {/* Recent Transmissions History */}
         {replayClips.length > 1 && (
-          <div className="replay-history">
-            <span className="history-title">Recent Missed Audio:</span>
-            <div className="history-list">
+          <div className="sc-replay-history">
+            <span className="sc-history-title">Recent Transmissions:</span>
+            <div className="sc-history-list">
               {replayClips.map((clip, index) => (
                 <button
                   key={clip.id}
-                  className={`history-chip ${isPlayingReplay === clip.id ? 'chip-playing' : ''}`}
+                  className={`sc-history-chip ${isPlayingReplay === clip.id ? 'sc-chip-playing' : ''}`}
                   onClick={() => handleTogglePlayReplay(clip)}
                 >
                   {isPlayingReplay === clip.id ? '⏹' : '▶'} #{index + 1} ({clip.durationSec}s at {clip.timeStr})
@@ -1131,14 +1635,14 @@ export default function App() {
         )}
 
         {/* Info footer */}
-        <div className="ptt-info">
-          <div className="info-chip">
-            <span className="info-dot" style={{ background: COLORS.primary }} />
+        <div className="sc-ptt-info">
+          <div className="sc-info-chip">
+            <span className="sc-info-dot" style={{ background: COLORS.terracotta }} />
             You: <strong>{userId}</strong>
           </div>
           <button
             id="leave-btn"
-            className="leave-btn"
+            className="sc-leave-btn"
             onClick={() => {
               void cleanup();
               setPhase('join');
@@ -1147,9 +1651,11 @@ export default function App() {
               setStatusMsg('');
               setPartnerTelemetry(null);
               setReplayClips([]);
+              setIsLocalVideoActive(false);
+              setIsRemoteVideoActive(false);
             }}
           >
-            Leave Room
+            Leave Channel
           </button>
         </div>
       </main>

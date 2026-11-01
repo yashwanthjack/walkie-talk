@@ -1,19 +1,8 @@
 /**
- * constants.ts — Shared config for the Walkie-Talkie PWA.
- *
- * HOW TO CONFIGURE:
- *   1. Run `ipconfig` (Windows) or `ip addr` (Linux/Android Termux) to find your LAN IP.
- *   2. Replace BACKEND_IP below with that IP so all devices on the same WiFi can reach the server.
- *   3. For internet access (outside your home WiFi), deploy the backend and put its URL here.
- *
- * ROOM & USER IDs:
- *   - Both devices must use the same ROOM_ID to be paired together.
- *   - Each device must have a unique USER_ID within that room.
- *   - You can change these freely — they are just strings.
+ * constants.ts — Shared config and Sandcastle Design System tokens.
  */
 
 // ─── Backend ────────────────────────────────────────────────────────────────
-// Live Render backend for production deployment.
 export const WS_BASE_URL = 'wss://walkie-talk.onrender.com';
 
 // ─── WebRTC ──────────────────────────────────────────────────────────────────
@@ -40,21 +29,46 @@ export const RTC_CONFIG: RTCConfiguration = {
   ],
 };
 
-// ─── Design Tokens ───────────────────────────────────────────────────────────
+// ─── Sandcastle Design Tokens ───────────────────────────────────────────────
 export const COLORS = {
-  background:      "#07070F",
-  surface:         "#0F0F1E",
-  surfaceElevated: "#16162A",
-  border:          "#1E1E3A",
-  primary:         "#7C6AFF",
-  primaryDim:      "#7C6AFF33",
-  primaryGlow:     "#7C6AFF",
-  success:         "#22D3EE",
-  successDim:      "#22D3EE22",
-  danger:          "#FF4D6A",
-  dangerDim:       "#FF4D6A22",
-  warning:         "#FFB547",
-  textPrimary:     "#F0F0FF",
-  textSecondary:   "#8080AA",
-  textMuted:       "#404065",
+  // Sandcastle Brand Colors
+  sandLight:       '#F7F4EE',
+  sandMedium:      '#EFEAE0',
+  sandBorder:      '#E4DCD0',
+  sandDarkText:    '#1C1917',
+  sandMutedText:   '#78716C',
+
+  // Walkie-Talkie Chassis (Warm Dark Basalt)
+  chassisBg:       '#1A1816',
+  chassisSurface:  '#23201C',
+  chassisElevated: '#2D2924',
+  chassisBorder:   '#3A352E',
+
+  // Brand Accents
+  terracotta:      '#D96343',
+  terracottaHover: '#C65435',
+  terracottaGlow:  'rgba(217, 99, 67, 0.45)',
+  olive:           '#5F6F52',
+  oliveDim:        'rgba(95, 111, 82, 0.18)',
+
+  // Indicators
+  emerald:         '#10B981',
+  emeraldDim:      'rgba(16, 185, 129, 0.18)',
+  danger:          '#EF4444',
+  dangerDim:       'rgba(239, 68, 68, 0.18)',
+  warning:         '#F59E0B',
+
+  // Legacy mappings for backwards compatibility
+  background:      '#F7F4EE',
+  surface:         '#23201C',
+  surfaceElevated: '#2D2924',
+  border:          '#3A352E',
+  primary:         '#D96343',
+  primaryDim:      'rgba(217, 99, 67, 0.25)',
+  primaryGlow:     '#D96343',
+  success:         '#10B981',
+  successDim:      'rgba(16, 185, 129, 0.2)',
+  textPrimary:     '#F5F2EB',
+  textSecondary:   '#A8A29E',
+  textMuted:       '#78716C',
 } as const;

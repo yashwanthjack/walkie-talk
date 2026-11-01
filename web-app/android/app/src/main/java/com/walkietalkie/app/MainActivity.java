@@ -26,11 +26,12 @@ public class MainActivity extends BridgeActivity {
     protected void onStart() {
         super.onStart();
 
-        // Request runtime permissions for RECORD_AUDIO and MODIFY_AUDIO_SETTINGS
+        // Request runtime permissions for RECORD_AUDIO, MODIFY_AUDIO_SETTINGS, and CAMERA
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             String[] needed = new String[]{
                     Manifest.permission.RECORD_AUDIO,
-                    Manifest.permission.MODIFY_AUDIO_SETTINGS
+                    Manifest.permission.MODIFY_AUDIO_SETTINGS,
+                    Manifest.permission.CAMERA
             };
             boolean allGranted = true;
             for (String perm : needed) {
