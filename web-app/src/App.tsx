@@ -73,19 +73,33 @@ export default function App() {
 
   // ─── Attach streams to video elements when video stage mounts ───────────
   useEffect(() => {
-    if (isRemoteVideoActive && remoteVideoRef.current && remoteVideoStreamRef.current) {
+    if (remoteVideoRef.current && remoteVideoStreamRef.current) {
       if (remoteVideoRef.current.srcObject !== remoteVideoStreamRef.current) {
         remoteVideoRef.current.srcObject = remoteVideoStreamRef.current;
       }
       remoteVideoRef.current.play().catch(err => console.warn('Remote video play error:', err));
     }
-    if (isLocalVideoActive && localVideoRef.current && localVideoStreamRef.current) {
+    if (localVideoRef.current && localVideoStreamRef.current) {
       if (localVideoRef.current.srcObject !== localVideoStreamRef.current) {
         localVideoRef.current.srcObject = localVideoStreamRef.current;
       }
       localVideoRef.current.play().catch(err => console.warn('Local video play error:', err));
     }
   }, [isLocalVideoActive, isRemoteVideoActive, isPipSwapped, isVideoMaximized]);
+
+  // ─── Hardware Frame Fallback Detector ───────────────────────────────────
+  useEffect(() => {
+    if (!isLocalVideoActive && !isRemoteVideoActive) return;
+
+    const checkInterval = setInterval(() => {
+      const videoEl = remoteVideoRef.current;
+      if (videoEl && videoEl.videoWidth > 0 && !videoEl.paused) {
+        setIsRemoteVideoActive(true);
+      }
+    }, 500);
+
+    return () => clearInterval(checkInterval);
+  }, [isLocalVideoActive, isRemoteVideoActive]);
 
   // ─── Escape Key to exit Maximized Video ──────────────────────────────────
   useEffect(() => {
@@ -194,6 +208,22 @@ export default function App() {
   }, []);
 
   // ─── Video Calling Functions ─────────────────────────────────────────────
+  const getOrCreateVideoSender = useCallback((pc: RTCPeerConnection): RTCRtpSender => {
+    const existing = pc.getTransceivers().find(
+      t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
+    );
+    if (existing) {
+      existing.direction = 'sendrecv';
+      videoTransceiverRef.current = existing;
+      videoSenderRef.current = existing.sender;
+      return existing.sender;
+    }
+    const transceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+    videoTransceiverRef.current = transceiver;
+    videoSenderRef.current = transceiver.sender;
+    return transceiver.sender;
+  }, []);
+
   const startLocalVideo = useCallback(async (facing: 'user' | 'environment') => {
     try {
       // Stop any existing local video track first
@@ -216,8 +246,14 @@ export default function App() {
       localVideoTrackRef.current = videoTrack;
       localVideoStreamRef.current = stream;
 
-      if (videoSenderRef.current) {
-        await videoSenderRef.current.replaceTrack(videoTrack);
+      const pc = pcRef.current;
+      const activeSender = pc
+        ? pc.getTransceivers().find(t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video')?.sender || videoSenderRef.current
+        : videoSenderRef.current;
+
+      if (activeSender) {
+        videoSenderRef.current = activeSender;
+        await activeSender.replaceTrack(videoTrack);
       }
 
       setIsLocalVideoActive(true);
@@ -242,9 +278,14 @@ export default function App() {
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = null;
     }
-    if (videoSenderRef.current) {
+    const pc = pcRef.current;
+    const activeSender = pc
+      ? pc.getTransceivers().find(t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video')?.sender || videoSenderRef.current
+      : videoSenderRef.current;
+
+    if (activeSender) {
       try {
-        await videoSenderRef.current.replaceTrack(null);
+        await activeSender.replaceTrack(null);
       } catch (e) {
         console.warn('replaceTrack null error:', e);
       }
@@ -288,6 +329,7 @@ export default function App() {
 
     if (!isLocalVideoActiveRef.current && !isRemoteVideoActive) {
       await startLocalVideo(facingMode);
+      setIsRemoteVideoActive(true);
       await sendEncryptedSignal({ type: 'video_sync', state: 'on' });
     } else {
       await stopLocalVideo();
@@ -862,10 +904,8 @@ export default function App() {
       pc.addTrack(t, localStreamRef.current!);
     });
 
-    // Pre-allocate a bidirectional video transceiver for instant replaceTrack
-    const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
-    videoTransceiverRef.current = videoTransceiver;
-    videoSenderRef.current = videoTransceiver.sender;
+    // Video transceiver is allocated on-demand via getOrCreateVideoSender(pc) before offer creation,
+    // or reused from setRemoteDescription(offer) on the answerer side.
 
     // Remote audio & video streams
     pc.ontrack = e => {
@@ -888,8 +928,10 @@ export default function App() {
 
         e.track.onunmute = () => {
           setIsRemoteVideoActive(true);
-          if (remoteVideoRef.current && remoteVideoStreamRef.current) {
-            remoteVideoRef.current.srcObject = remoteVideoStreamRef.current;
+          if (remoteVideoRef.current) {
+            if (remoteVideoRef.current.srcObject !== remoteVideoStreamRef.current) {
+              remoteVideoRef.current.srcObject = remoteVideoStreamRef.current;
+            }
             remoteVideoRef.current.play().catch(() => {});
           }
         };
@@ -941,6 +983,7 @@ export default function App() {
       if (peersRef.current.length === 0) return;
       try {
         makingOfferRef.current = true;
+        getOrCreateVideoSender(pc);
         await pc.setLocalDescription();
         void updateSafetyBadge(pc);
         await sendEncryptedSignal(
@@ -981,6 +1024,7 @@ export default function App() {
       if (pc) {
         try {
           makingOfferRef.current = true;
+          getOrCreateVideoSender(pc);
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
           void updateSafetyBadge(pc);
@@ -1007,10 +1051,16 @@ export default function App() {
     // ── Video Sync Signal (Dual Camera Auto Turn On / Off) ──
     if (msg.type === 'video_sync') {
       const desiredState = msg.state as string;
+      const isAck = Boolean(msg.isAck);
+
       if (desiredState === 'on') {
         setIsRemoteVideoActive(true);
         if (!isLocalVideoActiveRef.current) {
           void startLocalVideo('user');
+        }
+        if (!isAck) {
+          // Echo acknowledgment back so both peers guarantee isRemoteVideoActive = true
+          void sendEncryptedSignal({ type: 'video_sync', state: 'on', isAck: true });
         }
       } else if (desiredState === 'off') {
         setIsRemoteVideoActive(false);
@@ -1079,8 +1129,14 @@ export default function App() {
       await flushIceCandidateQueue(pc);
       void updateSafetyBadge(pc);
 
-      if (videoTransceiverRef.current) {
-        videoTransceiverRef.current.direction = 'sendrecv';
+      // Reuse the video transceiver created/matched by setRemoteDescription(offer)
+      const videoTransceiver = pc.getTransceivers().find(
+        t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
+      );
+      if (videoTransceiver) {
+        videoTransceiver.direction = 'sendrecv';
+        videoTransceiverRef.current = videoTransceiver;
+        videoSenderRef.current = videoTransceiver.sender;
       }
 
       await pc.setLocalDescription();
@@ -1317,6 +1373,21 @@ export default function App() {
                 ref={remoteVideoRef}
                 autoPlay
                 playsInline
+                onLoadedData={() => {
+                  if (remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0) {
+                    setIsRemoteVideoActive(true);
+                  }
+                }}
+                onPlaying={() => {
+                  if (remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0) {
+                    setIsRemoteVideoActive(true);
+                  }
+                }}
+                onResize={() => {
+                  if (remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0) {
+                    setIsRemoteVideoActive(true);
+                  }
+                }}
                 className={`sc-video-element ${!isRemoteVideoActive ? 'sc-video-waiting' : ''}`}
               />
               {!isRemoteVideoActive && (
