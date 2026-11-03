@@ -40,12 +40,12 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     if room_id not in rooms:
         rooms[room_id] = {}
 
-    # If user_id ALREADY exists in rooms[room_id], silently close the old socket and overwrite
+    # If user_id ALREADY exists in rooms[room_id], silently close the old socket with code 4000 and overwrite
     if user_id in rooms[room_id]:
         old_ws = rooms[room_id].pop(user_id, None)
         if old_ws:
             try:
-                await old_ws.close()
+                await old_ws.close(code=4000, reason="Replaced")
             except Exception:
                 pass
 

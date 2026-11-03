@@ -438,9 +438,15 @@ export default function App() {
     await releaseWakeLock();
 
     resetPeerConnection();
-    wsRef.current?.close();
+    if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      wsRef.current.onmessage = null;
+      wsRef.current.onopen = null;
+      wsRef.current.close();
+      wsRef.current = null;
+    }
     localStreamRef.current?.getTracks().forEach(t => t.stop());
-    wsRef.current = null;
     localStreamRef.current = null;
     remoteAudioStreamRef.current = null;
     localVideoStreamRef.current = null;
@@ -1134,7 +1140,11 @@ export default function App() {
     }
 
     if (msg.type === 'error') {
-      setStatusMsg(`❌ ${(msg.message as string) || 'Relay error'}`);
+      const errMsg = typeof msg.message === 'string' ? msg.message : '';
+      if (errMsg.toLowerCase().includes('already in use') || errMsg.toLowerCase().includes('different name')) {
+        return;
+      }
+      setStatusMsg(`❌ ${errMsg || 'Relay error'}`);
       return;
     }
   };
@@ -1201,15 +1211,39 @@ export default function App() {
     const effectiveRoom = await hashRoomWithPin(rawRoom, rawPin);
     setIsPinProtected(Boolean(rawPin));
 
-    // 3. Connect WebSocket
+    // Guard against duplicate connection if already connecting or open for this session
+    if (wsRef.current && (wsRef.current.readyState === WebSocket.CONNECTING || wsRef.current.readyState === WebSocket.OPEN)) {
+      console.log('WebSocket already active for this session, skipping duplicate join.');
+      return;
+    }
+
+    if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      wsRef.current.onmessage = null;
+      wsRef.current.onopen = null;
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    // 3. Connect WebSocket (using sessionStorage for per-tab isolation)
     setStatusMsg('Connecting to encrypted channel relay...');
-    const deviceId = localStorage.getItem('deviceId') || Math.random().toString(36).substring(2, 6);
-    localStorage.setItem('deviceId', deviceId);
+    let deviceId = '';
+    try {
+      deviceId = sessionStorage.getItem('deviceId') || '';
+      if (!deviceId) {
+        deviceId = Math.random().toString(36).substring(2, 6);
+        sessionStorage.setItem('deviceId', deviceId);
+      }
+    } catch {
+      deviceId = Math.random().toString(36).substring(2, 6);
+    }
     const socketUserId = `${rawUser}_${deviceId}`;
     const ws = new WebSocket(`${WS_BASE_URL}/ws/${effectiveRoom}/${encodeURIComponent(socketUserId)}`);
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) return;
       setStatusMsg('Waiting for partner on channel...');
       initPeerConnection(ws);
       setPhase('ready');
@@ -1217,12 +1251,18 @@ export default function App() {
     };
 
     ws.onerror = () => {
+      if (wsRef.current !== ws) return;
       setStatusMsg('❌ Cannot reach signaling server. Is the relay reachable?');
       setPhase('join');
       void cleanup();
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event: CloseEvent) => {
+      if (wsRef.current !== ws) return;
+      if (event.code === 4000) {
+        // Socket was intentionally replaced by another connection for this session
+        return;
+      }
       if (phase === 'ready') {
         setConnState('disconnected');
         setStatusMsg('🔌 Disconnected from channel.');
@@ -1230,6 +1270,7 @@ export default function App() {
     };
 
     ws.onmessage = async event => {
+      if (wsRef.current !== ws) return;
       try {
         const rawMsg = JSON.parse(event.data);
         let msg = rawMsg;
