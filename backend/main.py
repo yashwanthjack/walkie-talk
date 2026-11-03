@@ -40,7 +40,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     if room_id not in rooms:
         rooms[room_id] = {}
 
-    # If user_id ALREADY exists in rooms[room_id], grab old websocket, close it and broadcast peer_left
+    # If user_id ALREADY exists in rooms[room_id], silently close the old socket and overwrite
     if user_id in rooms[room_id]:
         old_ws = rooms[room_id].pop(user_id, None)
         if old_ws:
@@ -48,11 +48,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
                 await old_ws.close()
             except Exception:
                 pass
-            # Notify remaining peers that the previous session left before registering new one
-            await _broadcast_to_room(room_id, user_id, {
-                "type": "peer_left",
-                "user_id": user_id,
-            })
 
     # Register in room
     rooms[room_id][user_id] = websocket

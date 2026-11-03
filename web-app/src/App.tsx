@@ -37,6 +37,12 @@ interface TelemetryData {
   rttMs?: number | null;
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+const getDisplayName = (rawId: string | null | undefined): string => {
+  if (!rawId) return '';
+  return rawId.split('_')[0];
+};
+
 // ─── Main Component ──────────────────────────────────────────────────────────
 export default function App() {
   const [phase, setPhase] = useState<AppPhase>('join');
@@ -1104,7 +1110,7 @@ export default function App() {
     if (msg.type === 'buzzer') {
       playBuzzerSound();
       if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
-      const sender = typeof msg.from_user === 'string' ? msg.from_user : 'Partner';
+      const sender = typeof msg.from_user === 'string' ? getDisplayName(msg.from_user) : 'Partner';
       setBuzzerAlert(`🚨 PAGING ALERT FROM ${sender.toUpperCase()}!`);
       setTimeout(() => setBuzzerAlert(null), 4500);
       return;
@@ -1197,7 +1203,10 @@ export default function App() {
 
     // 3. Connect WebSocket
     setStatusMsg('Connecting to encrypted channel relay...');
-    const ws = new WebSocket(`${WS_BASE_URL}/ws/${effectiveRoom}/${encodeURIComponent(rawUser)}`);
+    const deviceId = localStorage.getItem('deviceId') || Math.random().toString(36).substring(2, 6);
+    localStorage.setItem('deviceId', deviceId);
+    const socketUserId = `${rawUser}_${deviceId}`;
+    const ws = new WebSocket(`${WS_BASE_URL}/ws/${effectiveRoom}/${encodeURIComponent(socketUserId)}`);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -1374,7 +1383,7 @@ export default function App() {
               autoCapitalize="none"
               autoCorrect="off"
             />
-            <span className="sc-form-hint">Each device in the channel must use a different name.</span>
+            <span className="sc-form-hint">Your callsign for this channel (e.g. pilot, base, yash).</span>
           </div>
 
           <button
@@ -1400,7 +1409,7 @@ export default function App() {
   }
 
   // ─── Render: Tactical PTT Screen (Sandcastle Theme) ──────────────────────
-  const partnerName = peers[0] || null;
+  const partnerName = peers[0] ? getDisplayName(peers[0]) : null;
 
   return (
     <div className="sc-app-shell">
