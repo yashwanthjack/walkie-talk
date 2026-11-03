@@ -185,6 +185,7 @@ export default function App() {
 
   // ICE candidate queue
   const iceCandidateQueueRef = useRef<RTCIceCandidateInit[]>([]);
+  const outgoingIceQueueRef = useRef<Record<string, unknown>[]>([]);
 
   // ─── Wake Lock Management ────────────────────────────────────────────────
   const requestWakeLock = useCallback(async () => {
@@ -486,6 +487,14 @@ export default function App() {
       }
     }
   };
+
+  const flushOutgoingIceCandidates = useCallback((targetId: string) => {
+    const queue = outgoingIceQueueRef.current;
+    outgoingIceQueueRef.current = [];
+    for (const msg of queue) {
+      void sendEncryptedSignal(msg, targetId);
+    }
+  }, [sendEncryptedSignal]);
 
   // ─── Start / Stop Incoming Recording (Replay Feature) ─────────────────────
   const startRecordingIncoming = () => {
@@ -885,19 +894,22 @@ export default function App() {
     pc.onicecandidate = e => {
       if (ws.readyState === WebSocket.OPEN) {
         const targetId = peersRef.current[0];
+        const cand = e.candidate
+          ? (e.candidate.toJSON
+              ? e.candidate.toJSON()
+              : {
+                  candidate: e.candidate.candidate,
+                  sdpMid: e.candidate.sdpMid,
+                  sdpMLineIndex: e.candidate.sdpMLineIndex,
+                  usernameFragment: e.candidate.usernameFragment,
+                })
+          : null;
+
+        const payload = { type: 'ice-candidate', candidate: cand };
         if (targetId) {
-          if (e.candidate) {
-            const cand = e.candidate.toJSON ? e.candidate.toJSON() : {
-              candidate: e.candidate.candidate,
-              sdpMid: e.candidate.sdpMid,
-              sdpMLineIndex: e.candidate.sdpMLineIndex,
-              usernameFragment: e.candidate.usernameFragment,
-            };
-            void sendEncryptedSignal({ type: 'ice-candidate', candidate: cand }, targetId);
-          } else {
-            // Signal end of candidate gathering
-            void sendEncryptedSignal({ type: 'ice-candidate', candidate: null }, targetId);
-          }
+          void sendEncryptedSignal(payload, targetId);
+        } else {
+          outgoingIceQueueRef.current.push(payload);
         }
       }
     };
@@ -981,6 +993,7 @@ export default function App() {
           await pc.setLocalDescription(offer);
           void updateSafetyBadge(pc);
           await sendEncryptedSignal({ type: 'offer', offer: pc.localDescription }, targetPeer);
+          flushOutgoingIceCandidates(targetPeer);
         } catch (e) {
           console.error('Initial offer error:', e);
         } finally {
@@ -1000,6 +1013,7 @@ export default function App() {
       // Existing peer resets PC and waits for newcomer's offer (avoids glare)
       resetPeerConnection();
       initPeerConnection(ws);
+      flushOutgoingIceCandidates(newPeer);
       return;
     }
 
@@ -1082,6 +1096,7 @@ export default function App() {
 
       const targetId = senderId ?? peersRef.current[0];
       await sendEncryptedSignal({ type: 'answer', answer: pc.localDescription }, targetId);
+      flushOutgoingIceCandidates(targetId);
       return;
     }
 
