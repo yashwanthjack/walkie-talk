@@ -131,6 +131,7 @@ export default function App() {
   }, [isReceiving]);
 
   const connStateRef = useRef<ConnState>('disconnected');
+  const watchdogTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     connStateRef.current = connState;
   }, [connState]);
@@ -174,7 +175,6 @@ export default function App() {
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const pingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const makingOfferRef = useRef(false);
-  const ignoreOfferRef = useRef(false);
   const politeRef = useRef(false);
 
   // ICE candidate queue
@@ -365,12 +365,35 @@ export default function App() {
     }
   }, []);
 
+  // ─── Reset Peer Connection Helper ─────────────────────────────────────────
+  const resetPeerConnection = useCallback(() => {
+    if (pcRef.current) {
+      pcRef.current.ontrack = null;
+      pcRef.current.onicecandidate = null;
+      pcRef.current.oniceconnectionstatechange = null;
+      pcRef.current.onconnectionstatechange = null;
+      pcRef.current.onnegotiationneeded = null;
+      try {
+        pcRef.current.close();
+      } catch {}
+      pcRef.current = null;
+    }
+    iceCandidateQueueRef.current = [];
+    videoSenderRef.current = null;
+    videoTransceiverRef.current = null;
+  }, []);
+
   // ─── Cleanup ────────────────────────────────────────────────────────────
   const cleanup = useCallback(async () => {
     try {
       await ForegroundService.stopForegroundService();
     } catch (error) {
       console.warn('Foreground service stop failed:', error);
+    }
+
+    if (watchdogTimerRef.current) {
+      clearTimeout(watchdogTimerRef.current);
+      watchdogTimerRef.current = null;
     }
 
     if (telemetryTimerRef.current) {
@@ -408,20 +431,17 @@ export default function App() {
     await stopLocalVideo();
     await releaseWakeLock();
 
+    resetPeerConnection();
     wsRef.current?.close();
-    pcRef.current?.close();
     localStreamRef.current?.getTracks().forEach(t => t.stop());
     wsRef.current = null;
-    pcRef.current = null;
     localStreamRef.current = null;
     remoteAudioStreamRef.current = null;
     localVideoStreamRef.current = null;
     remoteVideoStreamRef.current = null;
-    videoTransceiverRef.current = null;
-    iceCandidateQueueRef.current = [];
     cryptoKeyRef.current = null;
     setSafetyBadge(null);
-  }, [releaseWakeLock, stopLocalVideo]);
+  }, [releaseWakeLock, stopLocalVideo, resetPeerConnection]);
 
   useEffect(() => {
     return () => {
@@ -775,6 +795,344 @@ export default function App() {
     };
   }, [phase, connState, sendEncryptedSignal]);
 
+  // ─── Incoming Ping Visualizer ───────────────────────────────────────────
+  const triggerIncomingPing = useCallback(() => {
+    setIncomingPing(true);
+    if (pingTimeoutRef.current) clearTimeout(pingTimeoutRef.current);
+    pingTimeoutRef.current = setTimeout(() => setIncomingPing(false), 1500);
+  }, []);
+
+  // ─── Peer Connection & Video Transceiver Initialization ───────────────────
+  const initPeerConnection = useCallback((ws: WebSocket) => {
+    // If an existing PC is still open, tear it down cleanly first
+    if (pcRef.current) {
+      pcRef.current.ontrack = null;
+      pcRef.current.onicecandidate = null;
+      pcRef.current.oniceconnectionstatechange = null;
+      pcRef.current.onconnectionstatechange = null;
+      pcRef.current.onnegotiationneeded = null;
+      try {
+        pcRef.current.close();
+      } catch {}
+      pcRef.current = null;
+    }
+    iceCandidateQueueRef.current = [];
+    videoSenderRef.current = null;
+    videoTransceiverRef.current = null;
+
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    pcRef.current = pc;
+
+    // Add local audio tracks (keeps mic stream alive)
+    localStreamRef.current?.getTracks().forEach(t => {
+      pc.addTrack(t, localStreamRef.current!);
+    });
+
+    // If local camera is already active, wire it into the fresh peer connection
+    if (localVideoTrackRef.current) {
+      const sender = getOrCreateVideoSender(pc);
+      void sender.replaceTrack(localVideoTrackRef.current);
+    }
+
+    // Remote audio & video streams
+    pc.ontrack = e => {
+      if (e.track.kind === 'audio') {
+        remoteAudioStreamRef.current = e.streams[0];
+        const audioEl = remoteAudioRef.current;
+        if (audioEl) {
+          audioEl.srcObject = e.streams[0];
+          audioEl.play().catch(err => console.warn('Audio autoplay blocked:', err));
+        }
+      } else if (e.track.kind === 'video') {
+        const stream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
+        remoteVideoStreamRef.current = stream;
+        setIsRemoteVideoActive(true);
+
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = stream;
+          remoteVideoRef.current.play().catch(err => console.warn('Remote video play blocked:', err));
+        }
+
+        e.track.onunmute = () => {
+          setIsRemoteVideoActive(true);
+          if (remoteVideoRef.current) {
+            if (remoteVideoRef.current.srcObject !== remoteVideoStreamRef.current) {
+              remoteVideoRef.current.srcObject = remoteVideoStreamRef.current;
+            }
+            remoteVideoRef.current.play().catch(() => {});
+          }
+        };
+
+        e.track.onended = () => {
+          setIsRemoteVideoActive(false);
+        };
+      }
+    };
+
+    // ICE candidates (sent encrypted)
+    pc.onicecandidate = e => {
+      if (e.candidate && ws.readyState === WebSocket.OPEN) {
+        const targetId = peersRef.current[0];
+        if (targetId) {
+          void sendEncryptedSignal({ type: 'ice-candidate', candidate: e.candidate }, targetId);
+        }
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
+      if (s === 'connected' || s === 'completed') {
+        setConnState('connected');
+        setStatusMsg('🟢 Partner connected');
+        void updateSafetyBadge(pc);
+      } else if (s === 'disconnected' || s === 'failed' || s === 'closed') {
+        setConnState('disconnected');
+        setStatusMsg('⚠️ Partner disconnected');
+        setPeers([]);
+        setPartnerTelemetry(null);
+        setSafetyBadge(null);
+        setIsRemoteVideoActive(false);
+        resetPeerConnection();
+      } else if (s === 'checking') {
+        setConnState('connecting');
+        setStatusMsg('🔄 Establishing authenticated P2P...');
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        setConnState('connected');
+        setStatusMsg('🟢 Partner connected');
+        void updateSafetyBadge(pc);
+      }
+    };
+
+    pc.onnegotiationneeded = async () => {
+      if (peersRef.current.length === 0) return;
+      try {
+        makingOfferRef.current = true;
+        getOrCreateVideoSender(pc);
+        await pc.setLocalDescription();
+        void updateSafetyBadge(pc);
+        await sendEncryptedSignal(
+          { type: 'offer', offer: pc.localDescription },
+          peersRef.current[0]
+        );
+      } catch (e) {
+        console.error('Negotiation error:', e);
+      } finally {
+        makingOfferRef.current = false;
+      }
+    };
+
+    return pc;
+  }, [getOrCreateVideoSender, resetPeerConnection, sendEncryptedSignal, updateSafetyBadge]);
+
+  // ─── Signaling Message Handler ───────────────────────────────────────────
+  const handleSignal = async (msg: Record<string, unknown>, ws: WebSocket) => {
+    // ── Room State (Existing peers already in channel) ──
+    if (msg.type === 'room_state') {
+      const existingPeers = (msg.peers as string[]) ?? [];
+      setPeers(existingPeers);
+      politeRef.current = true;
+      if (existingPeers.length > 0) {
+        setStatusMsg('🔄 Partner found! Negotiating cipher & session...');
+        // New joiner initiates offer to the existing peer
+        const targetPeer = existingPeers[0];
+        resetPeerConnection();
+        const pc = initPeerConnection(ws);
+        try {
+          makingOfferRef.current = true;
+          getOrCreateVideoSender(pc);
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          void updateSafetyBadge(pc);
+          await sendEncryptedSignal({ type: 'offer', offer: pc.localDescription }, targetPeer);
+        } catch (e) {
+          console.error('Initial offer error:', e);
+        } finally {
+          makingOfferRef.current = false;
+        }
+      }
+      return;
+    }
+
+    // ── Peer Joined (New peer arrived) ──
+    if (msg.type === 'peer_joined') {
+      const newPeer = msg.user_id as string;
+      if (!newPeer) return;
+      setPeers(prev => (prev.includes(newPeer) ? prev : [...prev, newPeer]));
+      politeRef.current = false;
+      setStatusMsg('🔄 Partner found! Waiting for cipher handshake...');
+      // Existing peer resets PC and waits for newcomer's offer (avoids glare)
+      resetPeerConnection();
+      initPeerConnection(ws);
+      return;
+    }
+
+    // ── Peer Left ──
+    if (msg.type === 'peer_left') {
+      setConnState('disconnected');
+      setStatusMsg('⚠️ Partner left the channel');
+      setPeers(p => p.filter(id => id !== msg.user_id));
+      setPartnerTelemetry(null);
+      setSafetyBadge(null);
+      setIsRemoteVideoActive(false);
+      resetPeerConnection();
+      return;
+    }
+
+    // ── Request Offer / Renegotiate ──
+    if (msg.type === 'request_offer' || msg.type === 'renegotiate') {
+      const targetId = (msg.from_user as string) || peersRef.current[0];
+      if (targetId) {
+        resetPeerConnection();
+        const pc = initPeerConnection(ws);
+        try {
+          makingOfferRef.current = true;
+          getOrCreateVideoSender(pc);
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          void updateSafetyBadge(pc);
+          await sendEncryptedSignal({ type: 'offer', offer: pc.localDescription }, targetId);
+        } catch (e) {
+          console.warn('Renegotiate offer error:', e);
+        } finally {
+          makingOfferRef.current = false;
+        }
+      }
+      return;
+    }
+
+    // ── Offer ──
+    if (msg.type === 'offer') {
+      const senderId = msg.from_user as string;
+      if (senderId) {
+        setPeers(prev => (prev.includes(senderId) ? prev : [...prev, senderId]));
+        if (!peersRef.current.includes(senderId)) {
+          peersRef.current = [...peersRef.current, senderId];
+        }
+      }
+
+      // Always reset and create fresh PeerConnection to accept incoming offer cleanly
+      resetPeerConnection();
+      const pc = initPeerConnection(ws);
+
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.offer as RTCSessionDescriptionInit));
+      await flushIceCandidateQueue(pc);
+      void updateSafetyBadge(pc);
+
+      // Reuse the video transceiver created/matched by setRemoteDescription(offer)
+      const videoTransceiver = pc.getTransceivers().find(
+        t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
+      );
+      if (videoTransceiver) {
+        videoTransceiver.direction = 'sendrecv';
+        videoTransceiverRef.current = videoTransceiver;
+        videoSenderRef.current = videoTransceiver.sender;
+      }
+
+      await pc.setLocalDescription();
+      void updateSafetyBadge(pc);
+
+      const targetId = senderId ?? peersRef.current[0];
+      await sendEncryptedSignal({ type: 'answer', answer: pc.localDescription }, targetId);
+      return;
+    }
+
+    // ── Answer ──
+    if (msg.type === 'answer') {
+      const pc = pcRef.current;
+      if (!pc || pc.signalingState !== 'have-local-offer') return;
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.answer as RTCSessionDescriptionInit));
+      await flushIceCandidateQueue(pc);
+      void updateSafetyBadge(pc);
+      return;
+    }
+
+    // ── ICE Candidate ──
+    if (msg.type === 'ice-candidate' && msg.candidate) {
+      const pc = pcRef.current;
+      try {
+        if (pc && pc.remoteDescription) {
+          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit));
+        } else {
+          iceCandidateQueueRef.current.push(msg.candidate as RTCIceCandidateInit);
+        }
+      } catch (e) {
+        console.warn('ICE candidate error:', e);
+      }
+      return;
+    }
+
+    // ── Video Sync Signal (Dual Camera Auto Turn On / Off) ──
+    if (msg.type === 'video_sync') {
+      const desiredState = msg.state as string;
+      const isAck = Boolean(msg.isAck);
+
+      if (desiredState === 'on') {
+        setIsRemoteVideoActive(true);
+        if (!isLocalVideoActiveRef.current) {
+          void startLocalVideo('user');
+        }
+        if (!isAck) {
+          // Echo acknowledgment back so both peers guarantee isRemoteVideoActive = true
+          void sendEncryptedSignal({ type: 'video_sync', state: 'on', isAck: true });
+        }
+      } else if (desiredState === 'off') {
+        setIsRemoteVideoActive(false);
+        setIsVideoMaximized(false);
+        setIsPipSwapped(false);
+        if (isLocalVideoActiveRef.current) {
+          void stopLocalVideo();
+        }
+      }
+      return;
+    }
+
+    // ── Telemetry Signal ──
+    if (msg.type === 'telemetry') {
+      setPartnerTelemetry({
+        battery: typeof msg.battery === 'number' ? msg.battery : null,
+        charging: typeof msg.charging === 'boolean' ? msg.charging : undefined,
+        rttMs: typeof msg.rtt === 'number' ? msg.rtt : null,
+      });
+      return;
+    }
+
+    // ── Pager Buzzer Signal ──
+    if (msg.type === 'buzzer') {
+      playBuzzerSound();
+      if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
+      const sender = typeof msg.from_user === 'string' ? msg.from_user : 'Partner';
+      setBuzzerAlert(`🚨 PAGING ALERT FROM ${sender.toUpperCase()}!`);
+      setTimeout(() => setBuzzerAlert(null), 4500);
+      return;
+    }
+
+    // ── PTT Signals ──
+    if (msg.type === 'ptt_start') {
+      setIsReceiving(true);
+      triggerIncomingPing();
+      playPttStartChirp();
+      startRecordingIncoming();
+      if (navigator.vibrate) navigator.vibrate([30, 50, 30]);
+      return;
+    }
+
+    if (msg.type === 'ptt_end') {
+      setIsReceiving(false);
+      playTransmissionEnd();
+      stopRecordingIncoming();
+      return;
+    }
+
+    if (msg.type === 'error') {
+      setStatusMsg(`❌ ${(msg.message as string) || 'Relay error'}`);
+      return;
+    }
+  };
+
   // ─── Join Room ──────────────────────────────────────────────────────────
   const joinRoom = async () => {
     const rawRoom = roomId.trim();
@@ -894,286 +1252,46 @@ export default function App() {
     };
   };
 
-  // ─── Peer Connection & Video Transceiver ─────────────────────────────────
-  const initPeerConnection = (ws: WebSocket) => {
-    const pc = new RTCPeerConnection(RTC_CONFIG);
-    pcRef.current = pc;
-
-    // Add local audio tracks
-    localStreamRef.current?.getTracks().forEach(t => {
-      pc.addTrack(t, localStreamRef.current!);
-    });
-
-    // Video transceiver is allocated on-demand via getOrCreateVideoSender(pc) before offer creation,
-    // or reused from setRemoteDescription(offer) on the answerer side.
-
-    // Remote audio & video streams
-    pc.ontrack = e => {
-      if (e.track.kind === 'audio') {
-        remoteAudioStreamRef.current = e.streams[0];
-        const audioEl = remoteAudioRef.current;
-        if (audioEl) {
-          audioEl.srcObject = e.streams[0];
-          audioEl.play().catch(err => console.warn('Audio autoplay blocked:', err));
-        }
-      } else if (e.track.kind === 'video') {
-        const stream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
-        remoteVideoStreamRef.current = stream;
-        setIsRemoteVideoActive(true);
-
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = stream;
-          remoteVideoRef.current.play().catch(err => console.warn('Remote video play blocked:', err));
-        }
-
-        e.track.onunmute = () => {
-          setIsRemoteVideoActive(true);
-          if (remoteVideoRef.current) {
-            if (remoteVideoRef.current.srcObject !== remoteVideoStreamRef.current) {
-              remoteVideoRef.current.srcObject = remoteVideoStreamRef.current;
-            }
-            remoteVideoRef.current.play().catch(() => {});
-          }
-        };
-
-        e.track.onended = () => {
-          setIsRemoteVideoActive(false);
-        };
-      }
-    };
-
-    // ICE candidates (sent encrypted)
-    pc.onicecandidate = e => {
-      if (e.candidate && ws.readyState === WebSocket.OPEN) {
-        const targetId = peersRef.current[0];
-        if (targetId) {
-          void sendEncryptedSignal({ type: 'ice-candidate', candidate: e.candidate }, targetId);
-        }
-      }
-    };
-
-    pc.oniceconnectionstatechange = () => {
-      const s = pc.iceConnectionState;
-      if (s === 'connected' || s === 'completed') {
-        setConnState('connected');
-        setStatusMsg('🟢 Partner connected');
-        void updateSafetyBadge(pc);
-      } else if (s === 'disconnected' || s === 'failed' || s === 'closed') {
-        setConnState('disconnected');
-        setStatusMsg('⚠️ Partner disconnected');
-        setPeers([]);
-        setPartnerTelemetry(null);
-        setSafetyBadge(null);
-        setIsRemoteVideoActive(false);
-      } else if (s === 'checking') {
-        setConnState('connecting');
-        setStatusMsg('🔄 Establishing authenticated P2P...');
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') {
-        setConnState('connected');
-        setStatusMsg('🟢 Partner connected');
-        void updateSafetyBadge(pc);
-      }
-    };
-
-    pc.onnegotiationneeded = async () => {
-      if (peersRef.current.length === 0) return;
-      try {
-        makingOfferRef.current = true;
-        getOrCreateVideoSender(pc);
-        await pc.setLocalDescription();
-        void updateSafetyBadge(pc);
-        await sendEncryptedSignal(
-          { type: 'offer', offer: pc.localDescription },
-          peersRef.current[0]
-        );
-      } catch (e) {
-        console.error('Negotiation error:', e);
-      } finally {
-        makingOfferRef.current = false;
-      }
-    };
-
-    return pc;
-  };
-
-  // ─── Signaling Message Handler ───────────────────────────────────────────
-  const handleSignal = async (msg: Record<string, unknown>, _ws: WebSocket) => {
-    const pc = pcRef.current;
-
-    if (msg.type === 'room_state') {
-      const existingPeers = (msg.peers as string[]) ?? [];
-      setPeers(existingPeers);
-      politeRef.current = true;
-      if (existingPeers.length > 0) {
-        setStatusMsg('🔄 Partner found! Negotiating cipher & session...');
+  // ─── 3.5-Second Handshake Watchdog (Auto-Healing) ───────────────────────
+  useEffect(() => {
+    if (phase !== 'ready' || peers.length === 0 || connState === 'connected') {
+      if (watchdogTimerRef.current) {
+        clearTimeout(watchdogTimerRef.current);
+        watchdogTimerRef.current = null;
       }
       return;
     }
 
-    if (msg.type === 'peer_joined') {
-      const newPeer = msg.user_id as string;
-      if (!newPeer) return;
-      setPeers(prev => [...prev, newPeer]);
-      politeRef.current = false;
-      setStatusMsg('🔄 Partner found! Establishing E2EE session...');
-
-      if (pc) {
+    watchdogTimerRef.current = setTimeout(async () => {
+      const ws = wsRef.current;
+      const target = peersRef.current[0];
+      if (connStateRef.current !== 'connected' && target && ws && ws.readyState === WebSocket.OPEN) {
+        console.warn('⚡ Handshake watchdog triggered: Auto-healing WebRTC connection...');
+        setStatusMsg('🔄 Retrying authenticated handshake...');
+        resetPeerConnection();
+        const pc = initPeerConnection(ws);
         try {
           makingOfferRef.current = true;
           getOrCreateVideoSender(pc);
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
           void updateSafetyBadge(pc);
-          await sendEncryptedSignal({ type: 'offer', offer: pc.localDescription }, newPeer);
-        } catch (e) {
-          console.error('Offer error:', e);
+          await sendEncryptedSignal({ type: 'offer', offer: pc.localDescription }, target);
+        } catch (err) {
+          console.warn('Watchdog offer error:', err);
         } finally {
           makingOfferRef.current = false;
         }
       }
-      return;
-    }
+    }, 3500);
 
-    if (msg.type === 'peer_left') {
-      setConnState('disconnected');
-      setStatusMsg('⚠️ Partner left the channel');
-      setPeers(p => p.filter(id => id !== msg.user_id));
-      setPartnerTelemetry(null);
-      setSafetyBadge(null);
-      setIsRemoteVideoActive(false);
-      return;
-    }
-
-    // ── Video Sync Signal (Dual Camera Auto Turn On / Off) ──
-    if (msg.type === 'video_sync') {
-      const desiredState = msg.state as string;
-      const isAck = Boolean(msg.isAck);
-
-      if (desiredState === 'on') {
-        setIsRemoteVideoActive(true);
-        if (!isLocalVideoActiveRef.current) {
-          void startLocalVideo('user');
-        }
-        if (!isAck) {
-          // Echo acknowledgment back so both peers guarantee isRemoteVideoActive = true
-          void sendEncryptedSignal({ type: 'video_sync', state: 'on', isAck: true });
-        }
-      } else if (desiredState === 'off') {
-        setIsRemoteVideoActive(false);
-        setIsVideoMaximized(false);
-        setIsPipSwapped(false);
-        if (isLocalVideoActiveRef.current) {
-          void stopLocalVideo();
-        }
+    return () => {
+      if (watchdogTimerRef.current) {
+        clearTimeout(watchdogTimerRef.current);
+        watchdogTimerRef.current = null;
       }
-      return;
-    }
-
-    // ── Telemetry Signal ──
-    if (msg.type === 'telemetry') {
-      setPartnerTelemetry({
-        battery: typeof msg.battery === 'number' ? msg.battery : null,
-        charging: typeof msg.charging === 'boolean' ? msg.charging : undefined,
-        rttMs: typeof msg.rtt === 'number' ? msg.rtt : null,
-      });
-      return;
-    }
-
-    // ── Pager Buzzer Signal ──
-    if (msg.type === 'buzzer') {
-      playBuzzerSound();
-      if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
-      const sender = typeof msg.from_user === 'string' ? msg.from_user : 'Partner';
-      setBuzzerAlert(`🚨 PAGING ALERT FROM ${sender.toUpperCase()}!`);
-      setTimeout(() => setBuzzerAlert(null), 4500);
-      return;
-    }
-
-    // ── PTT Signals ──
-    if (msg.type === 'ptt_start') {
-      setIsReceiving(true);
-      triggerIncomingPing();
-      playPttStartChirp();
-      startRecordingIncoming();
-      if (navigator.vibrate) navigator.vibrate([30, 50, 30]);
-      return;
-    }
-
-    if (msg.type === 'ptt_end') {
-      setIsReceiving(false);
-      playTransmissionEnd();
-      stopRecordingIncoming();
-      return;
-    }
-
-    if (!pc) return;
-
-    if (msg.type === 'offer') {
-      const senderId = msg.from_user as string;
-      if (senderId) {
-        setPeers(prev => (prev.includes(senderId) ? prev : [...prev, senderId]));
-        if (!peersRef.current.includes(senderId)) {
-          peersRef.current = [...peersRef.current, senderId];
-        }
-      }
-
-      const offerCollision = makingOfferRef.current || pc.signalingState !== 'stable';
-      ignoreOfferRef.current = !politeRef.current && offerCollision;
-      if (ignoreOfferRef.current) return;
-
-      await pc.setRemoteDescription(new RTCSessionDescription(msg.offer as RTCSessionDescriptionInit));
-      await flushIceCandidateQueue(pc);
-      void updateSafetyBadge(pc);
-
-      // Reuse the video transceiver created/matched by setRemoteDescription(offer)
-      const videoTransceiver = pc.getTransceivers().find(
-        t => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
-      );
-      if (videoTransceiver) {
-        videoTransceiver.direction = 'sendrecv';
-        videoTransceiverRef.current = videoTransceiver;
-        videoSenderRef.current = videoTransceiver.sender;
-      }
-
-      await pc.setLocalDescription();
-      void updateSafetyBadge(pc);
-
-      const targetId = senderId ?? peersRef.current[0];
-      await sendEncryptedSignal({ type: 'answer', answer: pc.localDescription }, targetId);
-      return;
-    }
-
-    if (msg.type === 'answer') {
-      if (pc.signalingState !== 'have-local-offer') return;
-      await pc.setRemoteDescription(new RTCSessionDescription(msg.answer as RTCSessionDescriptionInit));
-      await flushIceCandidateQueue(pc);
-      void updateSafetyBadge(pc);
-      return;
-    }
-
-    if (msg.type === 'ice-candidate' && msg.candidate) {
-      try {
-        if (pc.remoteDescription) {
-          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit));
-        } else {
-          iceCandidateQueueRef.current.push(msg.candidate as RTCIceCandidateInit);
-        }
-      } catch (e) {
-        if (!ignoreOfferRef.current) console.error('ICE candidate error:', e);
-      }
-      return;
-    }
-  };
-
-  const triggerIncomingPing = () => {
-    setIncomingPing(true);
-    if (pingTimeoutRef.current) clearTimeout(pingTimeoutRef.current);
-    pingTimeoutRef.current = setTimeout(() => setIncomingPing(false), 1500);
-  };
+    };
+  }, [phase, peers, connState, resetPeerConnection, initPeerConnection, getOrCreateVideoSender, sendEncryptedSignal, updateSafetyBadge]);
 
   // ─── Render: Join Screen (Sandcastle Theme) ──────────────────────────────
   if (phase === 'join' || phase === 'connecting') {

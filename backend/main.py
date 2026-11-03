@@ -37,26 +37,24 @@ async def health():
 async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     await websocket.accept()
 
-    # Prevent duplicate usernames in the same room if the existing socket is alive
-    if room_id in rooms and user_id in rooms[room_id]:
-        existing_ws = rooms[room_id][user_id]
-        try:
-            # Check if previous connection is still alive
-            await existing_ws.send_text(json.dumps({"type": "ping"}))
-            # It's alive! Reject duplicate so it doesn't hijack or disconnect the active peer
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": f"Callsign '{user_id}' is already in use on this channel. Please use a different name for this device (e.g. {user_id}-2).",
-            }))
-            await websocket.close(code=4003, reason="Callsign already in use")
-            return
-        except Exception:
-            # Existing socket is dead/stale, prune it
-            _cleanup(room_id, user_id, existing_ws)
-
-    # Register in room
     if room_id not in rooms:
         rooms[room_id] = {}
+
+    # If user_id ALREADY exists in rooms[room_id], grab old websocket, close it and broadcast peer_left
+    if user_id in rooms[room_id]:
+        old_ws = rooms[room_id].pop(user_id, None)
+        if old_ws:
+            try:
+                await old_ws.close()
+            except Exception:
+                pass
+            # Notify remaining peers that the previous session left before registering new one
+            await _broadcast_to_room(room_id, user_id, {
+                "type": "peer_left",
+                "user_id": user_id,
+            })
+
+    # Register in room
     rooms[room_id][user_id] = websocket
     log.info(f"[{room_id}] '{user_id}' joined. Peers in room: {list(rooms[room_id].keys())}")
 
@@ -96,23 +94,25 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
                         "message": f"Peer '{target_id}' is not connected.",
                     }))
             else:
-                # Broadcast: relay to everyone else in the room
+                # Broadcast: relay to everyone else in the room (supports renegotiate, request_offer, etc.)
                 await _broadcast_to_room(room_id, user_id, message)
 
     except WebSocketDisconnect:
-        is_active = (rooms.get(room_id, {}).get(user_id) == websocket)
-        _cleanup(room_id, user_id, websocket)
         log.info(f"[{room_id}] '{user_id}' disconnected.")
-        if is_active:
-            # Only notify remaining peers if this socket was the active one
+    except Exception as e:
+        log.error(f"[{room_id}] Error for '{user_id}': {e}")
+    finally:
+        # CRITICAL BUG FIX: Only delete rooms[room_id][user_id] and broadcast peer_left
+        # IF rooms[room_id].get(user_id) is this exact WebSocket instance!
+        if rooms.get(room_id, {}).get(user_id) is websocket:
+            rooms[room_id].pop(user_id, None)
+            if not rooms[room_id]:
+                rooms.pop(room_id, None)
+                log.info(f"[{room_id}] Room is now empty and removed.")
             await _broadcast_to_room(room_id, None, {
                 "type": "peer_left",
                 "user_id": user_id,
             })
-
-    except Exception as e:
-        log.error(f"[{room_id}] Error for '{user_id}': {e}")
-        _cleanup(room_id, user_id, websocket)
 
 
 async def _broadcast_to_room(room_id: str, exclude_user_id: str | None, message: dict):
@@ -128,14 +128,7 @@ async def _broadcast_to_room(room_id: str, exclude_user_id: str | None, message:
             log.warning(f"[{room_id}] Send to '{uid}' failed ({e}), marking dead.")
             dead.append((uid, ws))
     for uid, ws in dead:
-        _cleanup(room_id, uid, ws)
-
-
-def _cleanup(room_id: str, user_id: str, ws: WebSocket | None = None):
-    """Remove a user from its room if the websocket matches, and prune empty rooms."""
-    if room_id in rooms:
-        if ws is None or rooms[room_id].get(user_id) == ws:
-            rooms[room_id].pop(user_id, None)
+        if rooms.get(room_id, {}).get(uid) is ws:
+            rooms[room_id].pop(uid, None)
             if not rooms[room_id]:
-                del rooms[room_id]
-                log.info(f"[{room_id}] Room is now empty and removed.")
+                rooms.pop(room_id, None)
