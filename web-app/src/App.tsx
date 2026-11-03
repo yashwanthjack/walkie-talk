@@ -883,10 +883,21 @@ export default function App() {
 
     // ICE candidates (sent encrypted)
     pc.onicecandidate = e => {
-      if (e.candidate && ws.readyState === WebSocket.OPEN) {
+      if (ws.readyState === WebSocket.OPEN) {
         const targetId = peersRef.current[0];
         if (targetId) {
-          void sendEncryptedSignal({ type: 'ice-candidate', candidate: e.candidate }, targetId);
+          if (e.candidate) {
+            const cand = e.candidate.toJSON ? e.candidate.toJSON() : {
+              candidate: e.candidate.candidate,
+              sdpMid: e.candidate.sdpMid,
+              sdpMLineIndex: e.candidate.sdpMLineIndex,
+              usernameFragment: e.candidate.usernameFragment,
+            };
+            void sendEncryptedSignal({ type: 'ice-candidate', candidate: cand }, targetId);
+          } else {
+            // Signal end of candidate gathering
+            void sendEncryptedSignal({ type: 'ice-candidate', candidate: null }, targetId);
+          }
         }
       }
     };
@@ -904,8 +915,15 @@ export default function App() {
         setConnState('connecting');
         setStatusMsg('📡 Reconnecting audio stream...');
       } else if (s === 'failed') {
-        setConnState('disconnected');
-        setStatusMsg('⚠️ Audio link interrupted. Reconnecting...');
+        setConnState('connecting');
+        setStatusMsg('📡 Reconnecting audio stream...');
+        if (pc.restartIce) {
+          try {
+            pc.restartIce();
+          } catch (err) {
+            console.warn('ICE restart error:', err);
+          }
+        }
         if (politeRef.current && ws.readyState === WebSocket.OPEN && peersRef.current[0]) {
           void sendEncryptedSignal({ type: 'renegotiate' }, peersRef.current[0]);
         }
@@ -924,8 +942,13 @@ export default function App() {
         setConnState('connecting');
         setStatusMsg('📡 Reconnecting audio stream...');
       } else if (s === 'failed') {
-        setConnState('disconnected');
-        setStatusMsg('⚠️ Audio link interrupted. Reconnecting...');
+        setConnState('connecting');
+        setStatusMsg('📡 Reconnecting audio stream...');
+        if (pc.restartIce) {
+          try {
+            pc.restartIce();
+          } catch {}
+        }
         if (politeRef.current && ws.readyState === WebSocket.OPEN && peersRef.current[0]) {
           void sendEncryptedSignal({ type: 'renegotiate' }, peersRef.current[0]);
         }
@@ -1076,13 +1099,19 @@ export default function App() {
     }
 
     // ── ICE Candidate ──
-    if (msg.type === 'ice-candidate' && msg.candidate) {
+    if (msg.type === 'ice-candidate') {
       const pc = pcRef.current;
+      const cand = msg.candidate as RTCIceCandidateInit | null;
       try {
-        if (pc && pc.remoteDescription) {
-          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit));
-        } else {
-          iceCandidateQueueRef.current.push(msg.candidate as RTCIceCandidateInit);
+        if (cand) {
+          if (pc && pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate(cand));
+          } else {
+            iceCandidateQueueRef.current.push(cand);
+          }
+        } else if (pc && pc.remoteDescription) {
+          // End of candidate gathering signal
+          await pc.addIceCandidate(null);
         }
       } catch (e) {
         console.warn('ICE candidate error:', e);
