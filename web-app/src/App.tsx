@@ -897,25 +897,38 @@ export default function App() {
         setConnState('connected');
         setStatusMsg('🟢 Partner connected');
         void updateSafetyBadge(pc);
-      } else if (s === 'disconnected' || s === 'failed' || s === 'closed') {
-        setConnState('disconnected');
-        setStatusMsg('⚠️ Partner disconnected');
-        setPeers([]);
-        setPartnerTelemetry(null);
-        setSafetyBadge(null);
-        setIsRemoteVideoActive(false);
-        resetPeerConnection();
       } else if (s === 'checking') {
         setConnState('connecting');
         setStatusMsg('🔄 Establishing authenticated P2P...');
+      } else if (s === 'disconnected') {
+        setConnState('connecting');
+        setStatusMsg('📡 Reconnecting audio stream...');
+      } else if (s === 'failed') {
+        setConnState('disconnected');
+        setStatusMsg('⚠️ Audio link interrupted. Reconnecting...');
+        if (politeRef.current && ws.readyState === WebSocket.OPEN && peersRef.current[0]) {
+          void sendEncryptedSignal({ type: 'renegotiate' }, peersRef.current[0]);
+        }
       }
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') {
+      const s = pc.connectionState;
+      if (s === 'connected') {
         setConnState('connected');
         setStatusMsg('🟢 Partner connected');
         void updateSafetyBadge(pc);
+      } else if (s === 'connecting') {
+        setConnState('connecting');
+      } else if (s === 'disconnected') {
+        setConnState('connecting');
+        setStatusMsg('📡 Reconnecting audio stream...');
+      } else if (s === 'failed') {
+        setConnState('disconnected');
+        setStatusMsg('⚠️ Audio link interrupted. Reconnecting...');
+        if (politeRef.current && ws.readyState === WebSocket.OPEN && peersRef.current[0]) {
+          void sendEncryptedSignal({ type: 'renegotiate' }, peersRef.current[0]);
+        }
       }
     };
 
@@ -938,7 +951,7 @@ export default function App() {
     };
 
     return pc;
-  }, [getOrCreateVideoSender, resetPeerConnection, sendEncryptedSignal, updateSafetyBadge]);
+  }, [getOrCreateVideoSender, sendEncryptedSignal, updateSafetyBadge]);
 
   // ─── Signaling Message Handler ───────────────────────────────────────────
   const handleSignal = async (msg: Record<string, unknown>, ws: WebSocket) => {
@@ -1302,7 +1315,7 @@ export default function App() {
     };
   };
 
-  // ─── 3.5-Second Handshake Watchdog (Auto-Healing) ───────────────────────
+  // ─── 12-Second Handshake Watchdog (Auto-Healing) ───────────────────────
   useEffect(() => {
     if (phase !== 'ready' || peers.length === 0 || connState === 'connected') {
       if (watchdogTimerRef.current) {
@@ -1315,25 +1328,12 @@ export default function App() {
     watchdogTimerRef.current = setTimeout(async () => {
       const ws = wsRef.current;
       const target = peersRef.current[0];
-      if (connStateRef.current !== 'connected' && target && ws && ws.readyState === WebSocket.OPEN) {
-        console.warn('⚡ Handshake watchdog triggered: Auto-healing WebRTC connection...');
+      if (connStateRef.current !== 'connected' && target && ws && ws.readyState === WebSocket.OPEN && politeRef.current) {
+        console.warn('⚡ Handshake watchdog: requesting renegotiation from partner...');
         setStatusMsg('🔄 Retrying authenticated handshake...');
-        resetPeerConnection();
-        const pc = initPeerConnection(ws);
-        try {
-          makingOfferRef.current = true;
-          getOrCreateVideoSender(pc);
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          void updateSafetyBadge(pc);
-          await sendEncryptedSignal({ type: 'offer', offer: pc.localDescription }, target);
-        } catch (err) {
-          console.warn('Watchdog offer error:', err);
-        } finally {
-          makingOfferRef.current = false;
-        }
+        void sendEncryptedSignal({ type: 'renegotiate' }, target);
       }
-    }, 3500);
+    }, 12000);
 
     return () => {
       if (watchdogTimerRef.current) {
@@ -1341,7 +1341,7 @@ export default function App() {
         watchdogTimerRef.current = null;
       }
     };
-  }, [phase, peers, connState, resetPeerConnection, initPeerConnection, getOrCreateVideoSender, sendEncryptedSignal, updateSafetyBadge]);
+  }, [phase, peers, connState, sendEncryptedSignal]);
 
   // ─── Render: Join Screen (Sandcastle Theme) ──────────────────────────────
   if (phase === 'join' || phase === 'connecting') {
