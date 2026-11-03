@@ -955,23 +955,8 @@ export default function App() {
       }
     };
 
-    pc.onnegotiationneeded = async () => {
-      if (peersRef.current.length === 0) return;
-      try {
-        makingOfferRef.current = true;
-        getOrCreateVideoSender(pc);
-        await pc.setLocalDescription();
-        void updateSafetyBadge(pc);
-        await sendEncryptedSignal(
-          { type: 'offer', offer: pc.localDescription },
-          peersRef.current[0]
-        );
-      } catch (e) {
-        console.error('Negotiation error:', e);
-      } finally {
-        makingOfferRef.current = false;
-      }
-    };
+    // Explicit signaling handles offers; disable onnegotiationneeded to avoid double-offer glare
+    pc.onnegotiationneeded = null;
 
     return pc;
   }, [getOrCreateVideoSender, sendEncryptedSignal, updateSafetyBadge]);
@@ -1062,9 +1047,21 @@ export default function App() {
         }
       }
 
-      // Always reset and create fresh PeerConnection to accept incoming offer cleanly
-      resetPeerConnection();
-      const pc = initPeerConnection(ws);
+      // Reuse existing prepared PeerConnection or initialize if none exists
+      let pc = pcRef.current;
+      if (!pc || pc.signalingState === 'closed') {
+        pc = initPeerConnection(ws);
+      }
+
+      // If there is an offer collision in have-local-offer state, handle cleanly
+      if (pc.signalingState !== 'stable') {
+        try {
+          await pc.setLocalDescription({ type: 'rollback' });
+        } catch {
+          resetPeerConnection();
+          pc = initPeerConnection(ws);
+        }
+      }
 
       await pc.setRemoteDescription(new RTCSessionDescription(msg.offer as RTCSessionDescriptionInit));
       await flushIceCandidateQueue(pc);
