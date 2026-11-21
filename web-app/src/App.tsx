@@ -137,7 +137,6 @@ export default function App() {
   }, [isReceiving]);
 
   const connStateRef = useRef<ConnState>('disconnected');
-  const watchdogTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     connStateRef.current = connState;
   }, [connState]);
@@ -334,9 +333,8 @@ export default function App() {
   const toggleVideo = async () => {
     if (connState !== 'connected' || peers.length === 0) return;
 
-    if (!isLocalVideoActiveRef.current && !isRemoteVideoActive) {
+    if (!isLocalVideoActiveRef.current) {
       await startLocalVideo(facingMode);
-      setIsRemoteVideoActive(true);
       await sendEncryptedSignal({ type: 'video_sync', state: 'on' });
     } else {
       await stopLocalVideo();
@@ -386,6 +384,7 @@ export default function App() {
       pcRef.current = null;
     }
     iceCandidateQueueRef.current = [];
+    outgoingIceQueueRef.current = [];
     videoSenderRef.current = null;
     videoTransceiverRef.current = null;
   }, []);
@@ -396,11 +395,6 @@ export default function App() {
       await ForegroundService.stopForegroundService();
     } catch (error) {
       console.warn('Foreground service stop failed:', error);
-    }
-
-    if (watchdogTimerRef.current) {
-      clearTimeout(watchdogTimerRef.current);
-      watchdogTimerRef.current = null;
     }
 
     if (telemetryTimerRef.current) {
@@ -477,7 +471,7 @@ export default function App() {
 
   // ─── Flush queued ICE candidates ────────────────────────────────────────
   const flushIceCandidateQueue = async (pc: RTCPeerConnection) => {
-    const queued = iceCandidateQueueRef.current;
+    const queued = [...iceCandidateQueueRef.current];
     iceCandidateQueueRef.current = [];
     for (const candidate of queued) {
       try {
@@ -489,7 +483,7 @@ export default function App() {
   };
 
   const flushOutgoingIceCandidates = useCallback((targetId: string) => {
-    const queue = outgoingIceQueueRef.current;
+    const queue = [...outgoingIceQueueRef.current];
     outgoingIceQueueRef.current = [];
     for (const msg of queue) {
       void sendEncryptedSignal(msg, targetId);
@@ -838,6 +832,7 @@ export default function App() {
       pcRef.current = null;
     }
     iceCandidateQueueRef.current = [];
+    outgoingIceQueueRef.current = [];
     videoSenderRef.current = null;
     videoTransceiverRef.current = null;
 
@@ -849,10 +844,12 @@ export default function App() {
       pc.addTrack(t, localStreamRef.current!);
     });
 
-    // If local camera is already active, wire it into the fresh peer connection
+    // Pre-allocate the bidirectional video transceiver so video is immediately ready for replaceTrack
+    const videoSender = getOrCreateVideoSender(pc);
+
+    // If local camera is already active, wire it into the transceiver
     if (localVideoTrackRef.current) {
-      const sender = getOrCreateVideoSender(pc);
-      void sender.replaceTrack(localVideoTrackRef.current);
+      void videoSender.replaceTrack(localVideoTrackRef.current);
     }
 
     // Remote audio & video streams
@@ -867,11 +864,8 @@ export default function App() {
       } else if (e.track.kind === 'video') {
         const stream = (e.streams && e.streams[0]) ? e.streams[0] : new MediaStream([e.track]);
         remoteVideoStreamRef.current = stream;
-        setIsRemoteVideoActive(true);
-
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = stream;
-          remoteVideoRef.current.play().catch(err => console.warn('Remote video play blocked:', err));
         }
 
         e.track.onunmute = () => {
@@ -880,8 +874,12 @@ export default function App() {
             if (remoteVideoRef.current.srcObject !== remoteVideoStreamRef.current) {
               remoteVideoRef.current.srcObject = remoteVideoStreamRef.current;
             }
-            remoteVideoRef.current.play().catch(() => {});
+            remoteVideoRef.current.play().catch(err => console.warn('Remote video play error:', err));
           }
+        };
+
+        e.track.onmute = () => {
+          setIsRemoteVideoActive(false);
         };
 
         e.track.onended = () => {
@@ -905,11 +903,13 @@ export default function App() {
                 })
           : null;
 
-        const payload = { type: 'ice-candidate', candidate: cand };
-        if (targetId) {
-          void sendEncryptedSignal(payload, targetId);
-        } else {
-          outgoingIceQueueRef.current.push(payload);
+        if (cand) {
+          const payload = { type: 'ice-candidate', candidate: cand };
+          if (targetId) {
+            void sendEncryptedSignal(payload, targetId);
+          } else {
+            outgoingIceQueueRef.current.push(payload);
+          }
         }
       }
     };
@@ -925,7 +925,7 @@ export default function App() {
         setStatusMsg('🔄 Establishing authenticated P2P...');
       } else if (s === 'disconnected') {
         setConnState('connecting');
-        setStatusMsg('📡 Reconnecting audio stream...');
+        setStatusMsg('📡 Audio link interrupted. Reconnecting...');
       } else if (s === 'failed') {
         setConnState('connecting');
         setStatusMsg('📡 Reconnecting audio stream...');
@@ -935,9 +935,6 @@ export default function App() {
           } catch (err) {
             console.warn('ICE restart error:', err);
           }
-        }
-        if (politeRef.current && ws.readyState === WebSocket.OPEN && peersRef.current[0]) {
-          void sendEncryptedSignal({ type: 'renegotiate' }, peersRef.current[0]);
         }
       }
     };
@@ -961,9 +958,6 @@ export default function App() {
             pc.restartIce();
           } catch {}
         }
-        if (politeRef.current && ws.readyState === WebSocket.OPEN && peersRef.current[0]) {
-          void sendEncryptedSignal({ type: 'renegotiate' }, peersRef.current[0]);
-        }
       }
     };
 
@@ -984,11 +978,12 @@ export default function App() {
         setStatusMsg('🔄 Partner found! Negotiating cipher & session...');
         // New joiner initiates offer to the existing peer
         const targetPeer = existingPeers[0];
-        resetPeerConnection();
-        const pc = initPeerConnection(ws);
+        let pc = pcRef.current;
+        if (!pc || pc.signalingState === 'closed') {
+          pc = initPeerConnection(ws);
+        }
         try {
           makingOfferRef.current = true;
-          getOrCreateVideoSender(pc);
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
           void updateSafetyBadge(pc);
@@ -1010,9 +1005,10 @@ export default function App() {
       setPeers(prev => (prev.includes(newPeer) ? prev : [...prev, newPeer]));
       politeRef.current = false;
       setStatusMsg('🔄 Partner found! Waiting for cipher handshake...');
-      // Existing peer resets PC and waits for newcomer's offer (avoids glare)
-      resetPeerConnection();
-      initPeerConnection(ws);
+      // Ensure PC is initialized and flush any early outgoing candidates
+      if (!pcRef.current || pcRef.current.signalingState === 'closed') {
+        initPeerConnection(ws);
+      }
       flushOutgoingIceCandidates(newPeer);
       return;
     }
@@ -1026,28 +1022,7 @@ export default function App() {
       setSafetyBadge(null);
       setIsRemoteVideoActive(false);
       resetPeerConnection();
-      return;
-    }
-
-    // ── Request Offer / Renegotiate ──
-    if (msg.type === 'request_offer' || msg.type === 'renegotiate') {
-      const targetId = (msg.from_user as string) || peersRef.current[0];
-      if (targetId) {
-        resetPeerConnection();
-        const pc = initPeerConnection(ws);
-        try {
-          makingOfferRef.current = true;
-          getOrCreateVideoSender(pc);
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          void updateSafetyBadge(pc);
-          await sendEncryptedSignal({ type: 'offer', offer: pc.localDescription }, targetId);
-        } catch (e) {
-          console.warn('Renegotiate offer error:', e);
-        } finally {
-          makingOfferRef.current = false;
-        }
-      }
+      initPeerConnection(ws);
       return;
     }
 
@@ -1091,7 +1066,8 @@ export default function App() {
         videoSenderRef.current = videoTransceiver.sender;
       }
 
-      await pc.setLocalDescription();
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
       void updateSafetyBadge(pc);
 
       const targetId = senderId ?? peersRef.current[0];
@@ -1116,12 +1092,12 @@ export default function App() {
       const cand = msg.candidate as RTCIceCandidateInit | null;
       try {
         if (cand) {
-          if (pc && pc.remoteDescription) {
+          if (pc && pc.remoteDescription && pc.signalingState !== 'closed') {
             await pc.addIceCandidate(new RTCIceCandidate(cand));
           } else {
             iceCandidateQueueRef.current.push(cand);
           }
-        } else if (pc && pc.remoteDescription) {
+        } else if (pc && pc.remoteDescription && pc.signalingState !== 'closed') {
           // End of candidate gathering signal
           await pc.addIceCandidate(null);
         }
@@ -1137,10 +1113,10 @@ export default function App() {
       const isAck = Boolean(msg.isAck);
 
       if (desiredState === 'on') {
-        setIsRemoteVideoActive(true);
         if (!isLocalVideoActiveRef.current) {
           void startLocalVideo('user');
         }
+        setIsRemoteVideoActive(true);
         if (!isAck) {
           // Echo acknowledgment back so both peers guarantee isRemoteVideoActive = true
           void sendEncryptedSignal({ type: 'video_sync', state: 'on', isAck: true });
@@ -1356,33 +1332,7 @@ export default function App() {
     };
   };
 
-  // ─── 12-Second Handshake Watchdog (Auto-Healing) ───────────────────────
-  useEffect(() => {
-    if (phase !== 'ready' || peers.length === 0 || connState === 'connected') {
-      if (watchdogTimerRef.current) {
-        clearTimeout(watchdogTimerRef.current);
-        watchdogTimerRef.current = null;
-      }
-      return;
-    }
 
-    watchdogTimerRef.current = setTimeout(async () => {
-      const ws = wsRef.current;
-      const target = peersRef.current[0];
-      if (connStateRef.current !== 'connected' && target && ws && ws.readyState === WebSocket.OPEN && politeRef.current) {
-        console.warn('⚡ Handshake watchdog: requesting renegotiation from partner...');
-        setStatusMsg('🔄 Retrying authenticated handshake...');
-        void sendEncryptedSignal({ type: 'renegotiate' }, target);
-      }
-    }, 12000);
-
-    return () => {
-      if (watchdogTimerRef.current) {
-        clearTimeout(watchdogTimerRef.current);
-        watchdogTimerRef.current = null;
-      }
-    };
-  }, [phase, peers, connState, sendEncryptedSignal]);
 
   // ─── Render: Join Screen (Sandcastle Theme) ──────────────────────────────
   if (phase === 'join' || phase === 'connecting') {
