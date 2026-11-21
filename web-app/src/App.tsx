@@ -40,7 +40,7 @@ interface TelemetryData {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 const getDisplayName = (rawId: string | null | undefined): string => {
   if (!rawId) return '';
-  return rawId.split('_')[0];
+  return rawId;
 };
 
 // ─── Main Component ──────────────────────────────────────────────────────────
@@ -1271,20 +1271,9 @@ export default function App() {
       wsRef.current = null;
     }
 
-    // 3. Connect WebSocket (using sessionStorage for per-tab isolation)
+    // 3. Connect WebSocket
     setStatusMsg('Connecting to encrypted channel relay...');
-    let deviceId = '';
-    try {
-      deviceId = sessionStorage.getItem('deviceId') || '';
-      if (!deviceId) {
-        deviceId = Math.random().toString(36).substring(2, 6);
-        sessionStorage.setItem('deviceId', deviceId);
-      }
-    } catch {
-      deviceId = Math.random().toString(36).substring(2, 6);
-    }
-    const socketUserId = `${rawUser}_${deviceId}`;
-    const ws = new WebSocket(`${WS_BASE_URL}/ws/${effectiveRoom}/${encodeURIComponent(socketUserId)}`);
+    const ws = new WebSocket(`${WS_BASE_URL}/ws/${effectiveRoom}/${encodeURIComponent(rawUser)}`);
     wsRef.current = ws;
 
     ws.onopen = () => {
