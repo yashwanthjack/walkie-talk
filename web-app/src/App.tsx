@@ -120,8 +120,10 @@ export default function App() {
 
   // Peers ref for WebRTC callbacks
   const peersRef = useRef<string[]>([]);
+  const activePeerRef = useRef<string | null>(null);
   useEffect(() => {
     peersRef.current = peers;
+    if (peers.length > 0) activePeerRef.current = peers[0];
   }, [peers]);
 
   const [isTransmitting, setIsTransmitting] = useState(false);
@@ -447,6 +449,8 @@ export default function App() {
     localVideoStreamRef.current = null;
     remoteVideoStreamRef.current = null;
     cryptoKeyRef.current = null;
+    activePeerRef.current = null;
+    peersRef.current = [];
     setSafetyBadge(null);
   }, [releaseWakeLock, stopLocalVideo, resetPeerConnection]);
 
@@ -869,8 +873,7 @@ export default function App() {
         }
 
         e.track.onunmute = () => {
-          setIsRemoteVideoActive(true);
-          if (remoteVideoRef.current) {
+          if (remoteVideoRef.current && remoteVideoStreamRef.current) {
             if (remoteVideoRef.current.srcObject !== remoteVideoStreamRef.current) {
               remoteVideoRef.current.srcObject = remoteVideoStreamRef.current;
             }
@@ -891,7 +894,7 @@ export default function App() {
     // ICE candidates (sent encrypted)
     pc.onicecandidate = e => {
       if (ws.readyState === WebSocket.OPEN) {
-        const targetId = peersRef.current[0];
+        const targetId = activePeerRef.current || peersRef.current[0];
         const cand = e.candidate
           ? (e.candidate.toJSON
               ? e.candidate.toJSON()
@@ -972,6 +975,10 @@ export default function App() {
     // ── Room State (Existing peers already in channel) ──
     if (msg.type === 'room_state') {
       const existingPeers = (msg.peers as string[]) ?? [];
+      peersRef.current = existingPeers;
+      if (existingPeers.length > 0) {
+        activePeerRef.current = existingPeers[0];
+      }
       setPeers(existingPeers);
       politeRef.current = true;
       if (existingPeers.length > 0) {
@@ -1002,6 +1009,8 @@ export default function App() {
     if (msg.type === 'peer_joined') {
       const newPeer = msg.user_id as string;
       if (!newPeer) return;
+      activePeerRef.current = newPeer;
+      peersRef.current = [newPeer];
       setPeers(prev => (prev.includes(newPeer) ? prev : [...prev, newPeer]));
       politeRef.current = false;
       setStatusMsg('🔄 Partner found! Waiting for cipher handshake...');
@@ -1017,6 +1026,8 @@ export default function App() {
     if (msg.type === 'peer_left') {
       setConnState('disconnected');
       setStatusMsg('⚠️ Partner left the channel');
+      activePeerRef.current = null;
+      peersRef.current = [];
       setPeers(p => p.filter(id => id !== msg.user_id));
       setPartnerTelemetry(null);
       setSafetyBadge(null);
@@ -1030,10 +1041,9 @@ export default function App() {
     if (msg.type === 'offer') {
       const senderId = msg.from_user as string;
       if (senderId) {
+        activePeerRef.current = senderId;
+        peersRef.current = [senderId];
         setPeers(prev => (prev.includes(senderId) ? prev : [...prev, senderId]));
-        if (!peersRef.current.includes(senderId)) {
-          peersRef.current = [...peersRef.current, senderId];
-        }
       }
 
       // Reuse existing prepared PeerConnection or initialize if none exists
@@ -1070,7 +1080,7 @@ export default function App() {
       await pc.setLocalDescription(answer);
       void updateSafetyBadge(pc);
 
-      const targetId = senderId ?? peersRef.current[0];
+      const targetId = senderId ?? activePeerRef.current ?? peersRef.current[0];
       await sendEncryptedSignal({ type: 'answer', answer: pc.localDescription }, targetId);
       flushOutgoingIceCandidates(targetId);
       return;
@@ -1078,6 +1088,11 @@ export default function App() {
 
     // ── Answer ──
     if (msg.type === 'answer') {
+      const senderId = msg.from_user as string;
+      if (senderId) {
+        activePeerRef.current = senderId;
+        peersRef.current = [senderId];
+      }
       const pc = pcRef.current;
       if (!pc || pc.signalingState !== 'have-local-offer') return;
       await pc.setRemoteDescription(new RTCSessionDescription(msg.answer as RTCSessionDescriptionInit));
