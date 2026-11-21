@@ -76,20 +76,23 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
             enriched = json.dumps(message)
 
             target_id = message.get("target_id")
+            msg_type = message.get("type", "unknown")
 
             if target_id:
                 # Unicast: relay directly to the specified peer
                 target_ws = rooms.get(room_id, {}).get(target_id)
                 if target_ws:
+                    log.info(f"[{room_id}] Relaying '{msg_type}' from '{user_id}' -> '{target_id}'")
                     await target_ws.send_text(enriched)
                 else:
-                    log.warning(f"[{room_id}] Target '{target_id}' not found.")
+                    log.warning(f"[{room_id}] Target '{target_id}' not found for message from '{user_id}'.")
                     await websocket.send_text(json.dumps({
                         "type": "error",
                         "message": f"Peer '{target_id}' is not connected.",
                     }))
             else:
                 # Broadcast: relay to everyone else in the room (supports renegotiate, request_offer, etc.)
+                log.info(f"[{room_id}] Broadcasting '{msg_type}' from '{user_id}'")
                 await _broadcast_to_room(room_id, user_id, message)
 
     except WebSocketDisconnect:
